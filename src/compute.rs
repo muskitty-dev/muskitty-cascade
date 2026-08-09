@@ -358,9 +358,12 @@ fn parse_var_args(value: &[ComponentValue]) -> Option<(String, &[ComponentValue]
     Some((name, fallback))
 }
 
-/// 解析相对长度维度（em/rem/vh/vw/vmin/vmax → px）。
+/// 解析长度维度（相对单位 + 绝对单位 → px）。
 ///
-/// 绝对单位（px/pt/pc/in/cm/mm）原样保留。
+/// - 相对单位：em/rem/vh/vw/vmin/vmax → px（依赖 ctx 基准）。
+/// - 绝对单位：px 原样保留；pt/pc/in/cm/mm/q 按 CSS Values L4 §5.1 锚点
+///   换算为 px（1in = 96px = 2.54cm = 25.4mm = 101.6q = 72pt = 6pc）。
+/// - 未知单位：原样保留（留给下游处理）。
 fn resolve_dimension(
     numeric: &Numeric,
     unit: &str,
@@ -382,8 +385,22 @@ fn resolve_dimension(
         Some(value * ctx.viewport_width.min(ctx.viewport_height) / 100.0)
     } else if unit.eq_ignore_ascii_case("vmax") {
         Some(value * ctx.viewport_width.max(ctx.viewport_height) / 100.0)
+    } else if unit.eq_ignore_ascii_case("pt") {
+        // 1pt = 1/72 in = 96/72 px
+        Some(value * (96.0 / 72.0))
+    } else if unit.eq_ignore_ascii_case("pc") {
+        // 1pc = 1/6 in = 16px
+        Some(value * (96.0 / 6.0))
+    } else if unit.eq_ignore_ascii_case("in") {
+        Some(value * 96.0)
+    } else if unit.eq_ignore_ascii_case("cm") {
+        Some(value * (96.0 / 2.54))
+    } else if unit.eq_ignore_ascii_case("mm") {
+        Some(value * (96.0 / 25.4))
+    } else if unit.eq_ignore_ascii_case("q") {
+        Some(value * (96.0 / 101.6))
     } else {
-        // 绝对单位 — 不转换
+        // 未知单位 — 不转换
         None
     };
 
@@ -940,5 +957,79 @@ mod tests {
             }
             other => panic!("expected Ident, got {:?}", other),
         }
+    }
+
+    // —— 绝对长度单位换算（P2-1，CSS Values L4 §5.1）——
+    // 换算锚点：1in = 96px；1in = 2.54cm = 25.4mm = 101.6q = 72pt = 6pc。
+
+    /// 断言单 Dimension token 的值接近 `expected` 且单位为 px。
+    fn assert_px(result: &ComputedValue, expected: f64) {
+        let cvs = result.tokens();
+        assert_eq!(cvs.len(), 1, "expected single token, got {:?}", cvs);
+        match &cvs[0] {
+            ComponentValue::PreservedToken(Token::Dimension(n, u)) => {
+                assert!(
+                    (n.value - expected).abs() < 1e-9,
+                    "expected ~{expected}px, got {}{}",
+                    n.value,
+                    u
+                );
+                assert_eq!(u, "px");
+            }
+            other => panic!("expected Dimension, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pt_converts_to_px() {
+        // 72pt = 1in = 96px → 1pt = 96/72 px
+        assert_px(
+            &compute_value("width", &[dim(72.0, "pt")], &empty_ctx()),
+            96.0,
+        );
+    }
+
+    #[test]
+    fn pc_converts_to_px() {
+        // 6pc = 1in = 96px → 1pc = 16px
+        assert_px(
+            &compute_value("width", &[dim(2.0, "pc")], &empty_ctx()),
+            32.0,
+        );
+    }
+
+    #[test]
+    fn in_converts_to_px() {
+        assert_px(
+            &compute_value("width", &[dim(1.0, "in")], &empty_ctx()),
+            96.0,
+        );
+    }
+
+    #[test]
+    fn cm_converts_to_px() {
+        // 2.54cm = 1in = 96px
+        assert_px(
+            &compute_value("width", &[dim(2.54, "cm")], &empty_ctx()),
+            96.0,
+        );
+    }
+
+    #[test]
+    fn mm_converts_to_px() {
+        // 25.4mm = 1in = 96px
+        assert_px(
+            &compute_value("width", &[dim(25.4, "mm")], &empty_ctx()),
+            96.0,
+        );
+    }
+
+    #[test]
+    fn q_converts_to_px() {
+        // 101.6q = 1in = 96px
+        assert_px(
+            &compute_value("width", &[dim(101.6, "q")], &empty_ctx()),
+            96.0,
+        );
     }
 }

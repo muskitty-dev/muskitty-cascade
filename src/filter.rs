@@ -19,7 +19,7 @@
 use crate::registry::lookup_property;
 use crate::style::DeclaredValue;
 use muskitty_css::parser::{parse_a_blocks_contents, BlockKind, ComponentValue, Rule, SimpleBlock};
-use muskitty_css::tokenizer::Token;
+use muskitty_css::tokenizer::{Numeric, Token};
 use muskitty_cssom::{serialize_component_values, CssRule, CssStyleSheet, Origin};
 use muskitty_selectors::matching::{matches, DomElement, Element as ElementTrait};
 use muskitty_selectors::parser::parse_a_selector;
@@ -381,9 +381,11 @@ fn normalize_property_name(name: &str) -> Option<String> {
 /// 收集一条声明的 DeclaredValue（sheets 与 inline style 共用）。
 ///
 /// 统一处理：
-/// - P2-2/P2-21：属性名归一化 + 未知属性过滤（[`normalize_property_name`]）。
-/// - P2-9：`gap` 简写展开为 `row-gap` + `column-gap` 两条合成声明
-///   （同 `order`，取第 1/第 2 分量），不再产出 `gap` 自身。
+/// - C1：简写展开（margin/padding/flex/background/font/gap）→ 多条长属性
+///   声明（共享同一 `order`/specificity/importance）。简写名
+///   （margin/padding/background/font）未注册，必须在
+///   [`normalize_property_name`] 过滤前展开。展开为空 = 简写值无效 → 丢弃。
+/// - P2-2/P2-21：其余属性名归一化 + 未知属性过滤（[`normalize_property_name`]）。
 ///
 /// `order` 由调用方递增后传入。
 #[allow(clippy::too_many_arguments)]
@@ -398,13 +400,8 @@ fn push_declared(
     layer_order: Option<usize>,
     from_style_attr: bool,
 ) {
-    let property = match normalize_property_name(name) {
-        Some(p) => p,
-        None => return,
-    };
-    if property == "gap" {
-        let (row, col) = split_gap_value(value);
-        for (p, v) in [("row-gap", row), ("column-gap", col)] {
+    if let Some(expanded) = expand_shorthand(name, value) {
+        for (p, v) in expanded {
             result.push(DeclaredValue {
                 property: p.to_string(),
                 value: v,
@@ -416,18 +413,23 @@ fn push_declared(
                 from_style_attr,
             });
         }
-    } else {
-        result.push(DeclaredValue {
-            property,
-            value: value.to_vec(),
-            important,
-            origin,
-            specificity,
-            order,
-            layer_order,
-            from_style_attr,
-        });
+        return;
     }
+
+    let property = match normalize_property_name(name) {
+        Some(p) => p,
+        None => return,
+    };
+    result.push(DeclaredValue {
+        property,
+        value: value.to_vec(),
+        important,
+        origin,
+        specificity,
+        order,
+        layer_order,
+        from_style_attr,
+    });
 }
 
 /// 将 `gap` 简写值拆分为 `(row-gap, column-gap)` 分量（P2-9）。
@@ -444,6 +446,382 @@ fn split_gap_value(value: &[ComponentValue]) -> (Vec<ComponentValue>, Vec<Compon
         [first, second, ..] => (vec![(*first).clone()], vec![(*second).clone()]),
         [] => (vec![], vec![]),
     }
+}
+
+// ── C1: 简写属性 → 长属性展开 ──────────────────────────────────
+
+/// 简写属性展开分派。非简写返回 `None`；简写返回展开后的长属性声明列表
+/// （可能为空 = 简写值无效，调用方丢弃整条声明）。
+///
+/// 属性名大小写不敏感（CSS §6.3.4）；`--*` 自定义属性不含简写名，天然不命中。
+fn expand_shorthand(
+    name: &str,
+    value: &[ComponentValue],
+) -> Option<Vec<(&'static str, Vec<ComponentValue>)>> {
+    if name.eq_ignore_ascii_case("margin") {
+        Some(expand_box_4(value, BOX_MARGIN))
+    } else if name.eq_ignore_ascii_case("padding") {
+        Some(expand_box_4(value, BOX_PADDING))
+    } else if name.eq_ignore_ascii_case("flex") {
+        Some(expand_flex(value))
+    } else if name.eq_ignore_ascii_case("background") {
+        Some(expand_background(value))
+    } else if name.eq_ignore_ascii_case("font") {
+        Some(expand_font(value))
+    } else if name.eq_ignore_ascii_case("gap") {
+        Some(expand_gap(value))
+    } else {
+        None
+    }
+}
+
+/// margin 四向长属性名。
+const BOX_MARGIN: [&str; 4] = ["margin-top", "margin-right", "margin-bottom", "margin-left"];
+/// padding 四向长属性名。
+const BOX_PADDING: [&str; 4] = [
+    "padding-top",
+    "padding-right",
+    "padding-bottom",
+    "padding-left",
+];
+
+/// `margin`/`padding` 简写（CSS Box Model L3 §3.1 / §4.2）。
+///
+/// 1/2/3/4 值拆分：`[a]` 全同；`[a b]` 上下=a 左右=b；`[a b c]` 上=a 左右=b
+/// 下=c；`[a b c d]` 顺时针 top/right/bottom/left。0 或 ≥5 分量 → 无效
+/// （返回空，声明丢弃）。单全局关键字（如 `margin: inherit`）→ 每个长属性
+/// 取该关键字（CSS Cascade L5 §3.2）。
+fn expand_box_4(
+    value: &[ComponentValue],
+    props: [&'static str; 4],
+) -> Vec<(&'static str, Vec<ComponentValue>)> {
+    if let Some(kw) = single_global_keyword(value) {
+        return props.iter().map(|p| (*p, vec![ident_token(&kw)])).collect();
+    }
+    let parts = non_ws_parts(value);
+    let at = |i: usize| vec![(*parts[i]).clone()];
+    match parts.len() {
+        1 => vec![
+            (props[0], at(0)),
+            (props[1], at(0)),
+            (props[2], at(0)),
+            (props[3], at(0)),
+        ],
+        2 => vec![
+            (props[0], at(0)),
+            (props[1], at(1)),
+            (props[2], at(0)),
+            (props[3], at(1)),
+        ],
+        3 => vec![
+            (props[0], at(0)),
+            (props[1], at(1)),
+            (props[2], at(2)),
+            (props[3], at(1)),
+        ],
+        4 => vec![
+            (props[0], at(0)),
+            (props[1], at(1)),
+            (props[2], at(2)),
+            (props[3], at(3)),
+        ],
+        _ => vec![],
+    }
+}
+
+/// `flex` 简写（CSS Flexbox L1 §7.1）。
+///
+/// 关键字：`none` → `0 0 auto`；`auto` → `1 1 auto`。分量形式
+/// `<grow> <shrink>? <basis>?`：省略时 grow=1、shrink=1、basis=0%
+/// （注意：与初始值 `0 1 auto` 不同——简写省略走 0%）。`<basis>` 可为长度
+/// 或百分比。grow/shrink 恒为数字；非法分量（函数/关键字混入）→ 无效。
+fn expand_flex(value: &[ComponentValue]) -> Vec<(&'static str, Vec<ComponentValue>)> {
+    if let Some(kw) = single_global_keyword(value) {
+        return ["flex-grow", "flex-shrink", "flex-basis"]
+            .iter()
+            .map(|p| (*p, vec![ident_token(&kw)]))
+            .collect();
+    }
+    let parts = non_ws_parts(value);
+    if parts.len() == 1 {
+        if let ComponentValue::PreservedToken(Token::Ident(s)) = parts[0] {
+            if s.eq_ignore_ascii_case("none") {
+                return vec![
+                    ("flex-grow", vec![number_token(0.0)]),
+                    ("flex-shrink", vec![number_token(0.0)]),
+                    ("flex-basis", vec![ident_token("auto")]),
+                ];
+            }
+            if s.eq_ignore_ascii_case("auto") {
+                return vec![
+                    ("flex-grow", vec![number_token(1.0)]),
+                    ("flex-shrink", vec![number_token(1.0)]),
+                    ("flex-basis", vec![ident_token("auto")]),
+                ];
+            }
+        }
+    }
+    let mut grow = 1.0;
+    let mut shrink = 1.0;
+    let mut basis: Vec<ComponentValue> = vec![percentage_token(0.0)];
+    match parts.as_slice() {
+        [a] => {
+            if let Some(n) = number_of(a) {
+                grow = n;
+            } else if is_length_pct(a) {
+                basis = vec![(*a).clone()];
+            } else {
+                return vec![];
+            }
+        }
+        [a, b] => {
+            let Some(na) = number_of(a) else {
+                return vec![];
+            };
+            grow = na;
+            if let Some(nb) = number_of(b) {
+                shrink = nb;
+            } else if is_length_pct(b) {
+                basis = vec![(*b).clone()];
+            } else {
+                return vec![];
+            }
+        }
+        [a, b, c] => {
+            let (Some(na), Some(nb)) = (number_of(a), number_of(b)) else {
+                return vec![];
+            };
+            grow = na;
+            shrink = nb;
+            if is_length_pct(c) {
+                basis = vec![(*c).clone()];
+            } else {
+                return vec![];
+            }
+        }
+        _ => return vec![],
+    }
+    vec![
+        ("flex-grow", vec![number_token(grow)]),
+        ("flex-shrink", vec![number_token(shrink)]),
+        ("flex-basis", basis),
+    ]
+}
+
+/// `background` 简写（CSS Backgrounds L3 §8.10）：仅展开 `background-color`。
+///
+/// 其余子属性（image/position/size/repeat/origin/clip/attachment）当前无消费
+/// 方，推迟到有消费方时再展开。无颜色分量 → `background-color: transparent`
+/// （初始值）。单全局关键字 → `background-color` 取该关键字。
+fn expand_background(value: &[ComponentValue]) -> Vec<(&'static str, Vec<ComponentValue>)> {
+    if let Some(kw) = single_global_keyword(value) {
+        return vec![("background-color", vec![ident_token(&kw)])];
+    }
+    let color = non_ws_parts(value)
+        .into_iter()
+        .find(|cv| is_background_color(cv));
+    let color_cv = match color {
+        Some(c) => (*c).clone(),
+        None => ident_token("transparent"),
+    };
+    vec![("background-color", vec![color_cv])]
+}
+
+/// `font` 简写（CSS Fonts L3 §3.8）：仅展开 `font-size`（+ 可选 `line-height`）。
+///
+/// style/variant/weight/stretch/family 无消费方，推迟。解析：跳过可选
+/// style/variant/weight 前缀关键字，取 `<font-size>`（长度/百分比/绝对尺寸
+/// 关键字），可选 `/ <line-height>`。缺 font-size → 无效（返回空）。
+fn expand_font(value: &[ComponentValue]) -> Vec<(&'static str, Vec<ComponentValue>)> {
+    if let Some(kw) = single_global_keyword(value) {
+        return vec![("font-size", vec![ident_token(&kw)])];
+    }
+    let parts = non_ws_parts(value);
+    let mut i = 0;
+    while i < parts.len() && is_font_pre_keyword(parts[i]) {
+        i += 1;
+    }
+    let size = match parts.get(i) {
+        Some(cv) if is_font_size(cv) => cv,
+        _ => return vec![], // 缺 font-size → 无效简写
+    };
+    i += 1;
+    let mut result = vec![("font-size", vec![(*size).clone()])];
+    // 可选 `/ <line-height>`
+    if i < parts.len() && matches!(parts[i], ComponentValue::PreservedToken(Token::Delim('/'))) {
+        if let Some(lh) = parts.get(i + 1) {
+            result.push(("line-height", vec![(*lh).clone()]));
+        }
+    }
+    result
+}
+
+/// `gap` 简写（CSS Box Alignment L3 §6.2）：复用 [`split_gap_value`]（P2-9）。
+fn expand_gap(value: &[ComponentValue]) -> Vec<(&'static str, Vec<ComponentValue>)> {
+    let (row, col) = split_gap_value(value);
+    vec![("row-gap", row), ("column-gap", col)]
+}
+
+/// 取非空白分量（借用）。
+fn non_ws_parts(value: &[ComponentValue]) -> Vec<&ComponentValue> {
+    value
+        .iter()
+        .filter(|cv| !matches!(cv, ComponentValue::PreservedToken(Token::Whitespace)))
+        .collect()
+}
+
+/// 若值是单个全局关键字（inherit/initial/unset/revert/revert-layer），返回它。
+///
+/// CSS Cascade L5 §3.2: 简写取全局关键字时，每个长属性均取该关键字。
+fn single_global_keyword(value: &[ComponentValue]) -> Option<String> {
+    let parts = non_ws_parts(value);
+    if parts.len() == 1 {
+        if let ComponentValue::PreservedToken(Token::Ident(s)) = parts[0] {
+            if is_global_keyword(s) {
+                return Some(s.clone());
+            }
+        }
+    }
+    None
+}
+
+/// 是否为全局关键字。
+fn is_global_keyword(s: &str) -> bool {
+    s.eq_ignore_ascii_case("inherit")
+        || s.eq_ignore_ascii_case("initial")
+        || s.eq_ignore_ascii_case("unset")
+        || s.eq_ignore_ascii_case("revert")
+        || s.eq_ignore_ascii_case("revert-layer")
+}
+
+/// background 中可作颜色的分量：hash / 颜色函数 / 非背景关键字 ident。
+///
+/// 反集法（C1）：背景关键字集合封闭（~20 个），不在集合内的 ident 即候选
+/// 颜色（red/green/transparent/currentcolor 等），无需完整颜色名表。
+/// 单全局关键字由 [`single_global_keyword`] 先行处理，不会进入此处。
+fn is_background_color(cv: &ComponentValue) -> bool {
+    match cv {
+        ComponentValue::PreservedToken(Token::Hash(..)) => true,
+        ComponentValue::PreservedToken(Token::Ident(s)) => !BACKGROUND_NON_COLOR
+            .iter()
+            .any(|k| s.eq_ignore_ascii_case(k)),
+        ComponentValue::Function(f) => {
+            f.name.eq_ignore_ascii_case("rgb")
+                || f.name.eq_ignore_ascii_case("rgba")
+                || f.name.eq_ignore_ascii_case("hsl")
+                || f.name.eq_ignore_ascii_case("hsla")
+                || f.name.eq_ignore_ascii_case("hwb")
+                || f.name.eq_ignore_ascii_case("lab")
+                || f.name.eq_ignore_ascii_case("lch")
+                || f.name.eq_ignore_ascii_case("oklab")
+                || f.name.eq_ignore_ascii_case("oklch")
+                || f.name.eq_ignore_ascii_case("color")
+        }
+        _ => false,
+    }
+}
+
+/// background 中非颜色的关键字（反集法识别颜色的排除集）。
+const BACKGROUND_NON_COLOR: &[&str] = &[
+    "none",
+    "repeat",
+    "repeat-x",
+    "repeat-y",
+    "no-repeat",
+    "space",
+    "round",
+    "scroll",
+    "fixed",
+    "local",
+    "border-box",
+    "padding-box",
+    "content-box",
+    "cover",
+    "contain",
+    "center",
+    "top",
+    "bottom",
+    "left",
+    "right",
+];
+
+/// font 简写 style/variant/weight 前缀关键字（跳过）。
+fn is_font_pre_keyword(cv: &ComponentValue) -> bool {
+    match cv {
+        ComponentValue::PreservedToken(Token::Ident(s)) => {
+            s.eq_ignore_ascii_case("normal")
+                || s.eq_ignore_ascii_case("italic")
+                || s.eq_ignore_ascii_case("oblique")
+                || s.eq_ignore_ascii_case("small-caps")
+                || s.eq_ignore_ascii_case("bold")
+                || s.eq_ignore_ascii_case("bolder")
+                || s.eq_ignore_ascii_case("lighter")
+        }
+        // 数字字重（font-weight: 100-900，可含中间值）
+        ComponentValue::PreservedToken(Token::Number(n)) => {
+            n.value.fract() == 0.0 && (1.0..=1000.0).contains(&n.value)
+        }
+        _ => false,
+    }
+}
+
+/// `<font-size>`：长度 / 百分比 / 绝对尺寸关键字（CSS Fonts L3 §3.5）。
+fn is_font_size(cv: &ComponentValue) -> bool {
+    match cv {
+        ComponentValue::PreservedToken(Token::Dimension(..))
+        | ComponentValue::PreservedToken(Token::Percentage(..)) => true,
+        ComponentValue::PreservedToken(Token::Ident(s)) => {
+            s.eq_ignore_ascii_case("xx-small")
+                || s.eq_ignore_ascii_case("x-small")
+                || s.eq_ignore_ascii_case("small")
+                || s.eq_ignore_ascii_case("medium")
+                || s.eq_ignore_ascii_case("large")
+                || s.eq_ignore_ascii_case("x-large")
+                || s.eq_ignore_ascii_case("xx-large")
+                || s.eq_ignore_ascii_case("xxx-large")
+                || s.eq_ignore_ascii_case("larger")
+                || s.eq_ignore_ascii_case("smaller")
+        }
+        _ => false,
+    }
+}
+
+/// 取 `<number>` 分量的值（非 number 返回 `None`）。
+fn number_of(cv: &ComponentValue) -> Option<f64> {
+    match cv {
+        ComponentValue::PreservedToken(Token::Number(n)) => Some(n.value),
+        _ => None,
+    }
+}
+
+/// 是否为 `<length>` 或 `<percentage>` 分量。
+fn is_length_pct(cv: &ComponentValue) -> bool {
+    matches!(
+        cv,
+        ComponentValue::PreservedToken(Token::Dimension(..))
+            | ComponentValue::PreservedToken(Token::Percentage(..))
+    )
+}
+
+/// 构造 Ident token。
+fn ident_token(s: &str) -> ComponentValue {
+    ComponentValue::PreservedToken(Token::Ident(s.to_string()))
+}
+
+/// 构造 Number token。
+fn number_token(v: f64) -> ComponentValue {
+    ComponentValue::PreservedToken(Token::Number(Numeric {
+        value: v,
+        is_integer: v.fract() == 0.0,
+    }))
+}
+
+/// 构造 Percentage token。
+fn percentage_token(v: f64) -> ComponentValue {
+    ComponentValue::PreservedToken(Token::Percentage(Numeric {
+        value: v,
+        is_integer: v.fract() == 0.0,
+    }))
 }
 
 // ── P2-6: @media / @supports 条件评估 ─────────────────────────────

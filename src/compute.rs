@@ -9,7 +9,7 @@
 
 use crate::registry::{lookup_property, PercentageBasis};
 use crate::style::ComputedValue;
-use muskitty_css::parser::{ComponentValue, Function};
+use muskitty_css::parser::{BlockKind, ComponentValue, Function};
 use muskitty_css::tokenizer::{Numeric, Token};
 use std::collections::{HashMap, HashSet};
 
@@ -233,6 +233,13 @@ impl<'a> VarResolver<'a> {
             // 其他函数（如 calc()）— 递归解析参数
             ComponentValue::Function(func) => {
                 let resolved_args = self.resolve_tokens(&func.value, property)?;
+                // calc() 数值求值（P3-2）：可求值 → 折叠为单值；否则保留函数
+                // （layout 侧对不可求值 calc 仍走 extract_px/extract_percent 兜底）。
+                if func.name.eq_ignore_ascii_case("calc") {
+                    if let Some(folded) = evaluate_calc(&resolved_args) {
+                        return Ok(vec![folded]);
+                    }
+                }
                 Ok(vec![ComponentValue::Function(Function {
                     name: func.name.clone(),
                     value: resolved_args,
@@ -358,6 +365,197 @@ fn parse_var_args(value: &[ComponentValue]) -> Option<(String, &[ComponentValue]
     Some((name, fallback))
 }
 
+/// calc() 求值的中间值（CSS Values L4 §9）。
+///
+/// 一个可相加/相乘的数量：纯数字、带单位长度（px 等）、或百分比。
+/// 类型不兼容的运算（length + number、px × px 等）返回 `None`（不可求值，
+/// 保留 calc 函数由下游兜底）。
+#[derive(Debug, Clone)]
+enum CalcValue {
+    Number(f64),
+    Dimension(f64, String),
+    Percentage(f64),
+}
+
+impl CalcValue {
+    /// 折叠为单个 component value。
+    fn into_component_value(self) -> ComponentValue {
+        match self {
+            CalcValue::Number(v) => ComponentValue::PreservedToken(Token::Number(Numeric {
+                value: v,
+                is_integer: false,
+            })),
+            CalcValue::Dimension(v, unit) => ComponentValue::PreservedToken(Token::Dimension(
+                Numeric {
+                    value: v,
+                    is_integer: false,
+                },
+                unit,
+            )),
+            CalcValue::Percentage(v) => {
+                ComponentValue::PreservedToken(Token::Percentage(Numeric {
+                    value: v,
+                    is_integer: false,
+                }))
+            }
+        }
+    }
+}
+
+/// §9 解析并求值 `calc(...)` 表达式（calc-sum → calc-product → calc-value）。
+///
+/// 求值入口：`resolve_component` 遇到 `calc()` 时调用。调用方保证参数已完成
+/// var() 替换与相对单位解析（因此 em/pt 等均已归一到 px）。可求值（全部类型
+/// 兼容、无除零）时返回折叠后的单值；否则返回 `None`，调用方保留 calc 函数，
+/// 由 layout 侧 extract_px/extract_percent 兜底。
+fn evaluate_calc(args: &[ComponentValue]) -> Option<ComponentValue> {
+    let mut pos = 0;
+    let sum = parse_calc_sum(args, &mut pos)?;
+    skip_ws(args, &mut pos);
+    if pos != args.len() {
+        return None; // 尾随内容（如 `10px 5px`）→ 语法无效
+    }
+    Some(sum.into_component_value())
+}
+
+/// calc-sum: `<calc-product> [ [ '+' | '-' ] <calc-product> ]*`（左结合）。
+fn parse_calc_sum(cvs: &[ComponentValue], pos: &mut usize) -> Option<CalcValue> {
+    let mut left = parse_calc_product(cvs, pos)?;
+    loop {
+        skip_ws(cvs, pos);
+        let Some(op) = peek_delim(cvs, *pos) else {
+            break; // 输入结束或下一项不是操作符 → sum 解析完成
+        };
+        if op != '+' && op != '-' {
+            // 非加减操作符（`*`/`/`）属于 product 层级，回退。
+            break;
+        }
+        *pos += 1; // 消费操作符
+        let right = parse_calc_product(cvs, pos)?;
+        left = apply_add_sub(op, left, right)?;
+    }
+    Some(left)
+}
+
+/// calc-product: `<calc-value> [ [ '*' | '/' ] <calc-value> ]*`（左结合）。
+fn parse_calc_product(cvs: &[ComponentValue], pos: &mut usize) -> Option<CalcValue> {
+    let mut left = parse_calc_value(cvs, pos)?;
+    loop {
+        skip_ws(cvs, pos);
+        let Some(op) = peek_delim(cvs, *pos) else {
+            break; // 输入结束或下一项不是操作符 → product 解析完成
+        };
+        if op != '*' && op != '/' {
+            // 加减操作符属于 sum 层级，回退。
+            break;
+        }
+        *pos += 1; // 消费操作符
+        let right = parse_calc_value(cvs, pos)?;
+        left = apply_mul_div(op, left, right)?;
+    }
+    Some(left)
+}
+
+/// calc-value: `<number> | <dimension> | <percentage> | ( <calc-sum> )`。
+/// 也接受嵌套 `calc(...)`（内层同样求值）。
+fn parse_calc_value(cvs: &[ComponentValue], pos: &mut usize) -> Option<CalcValue> {
+    skip_ws(cvs, pos);
+    match cvs.get(*pos)? {
+        ComponentValue::PreservedToken(Token::Number(n)) => {
+            *pos += 1;
+            Some(CalcValue::Number(n.value))
+        }
+        ComponentValue::PreservedToken(Token::Dimension(n, unit)) => {
+            *pos += 1;
+            Some(CalcValue::Dimension(n.value, unit.clone()))
+        }
+        ComponentValue::PreservedToken(Token::Percentage(n)) => {
+            *pos += 1;
+            Some(CalcValue::Percentage(n.value))
+        }
+        ComponentValue::SimpleBlock(sb) if sb.kind == BlockKind::Paren => {
+            *pos += 1;
+            let mut inner = 0;
+            let v = parse_calc_sum(&sb.value, &mut inner)?;
+            skip_ws(&sb.value, &mut inner);
+            (inner == sb.value.len()).then_some(v)
+        }
+        ComponentValue::Function(f) if f.name.eq_ignore_ascii_case("calc") => {
+            *pos += 1;
+            let mut inner = 0;
+            let v = parse_calc_sum(&f.value, &mut inner)?;
+            skip_ws(&f.value, &mut inner);
+            (inner == f.value.len()).then_some(v)
+        }
+        _ => None,
+    }
+}
+
+/// 加减：两侧类型必须一致（number/number、同 unit dimension、percentage）。
+fn apply_add_sub(op: char, left: CalcValue, right: CalcValue) -> Option<CalcValue> {
+    let combine = |a: f64, b: f64| if op == '+' { a + b } else { a - b };
+    match (left, right) {
+        (CalcValue::Number(a), CalcValue::Number(b)) => Some(CalcValue::Number(combine(a, b))),
+        (CalcValue::Dimension(a, ua), CalcValue::Dimension(b, ub))
+            if ua.eq_ignore_ascii_case(&ub) =>
+        {
+            Some(CalcValue::Dimension(combine(a, b), ua))
+        }
+        (CalcValue::Percentage(a), CalcValue::Percentage(b)) => {
+            Some(CalcValue::Percentage(combine(a, b)))
+        }
+        // 类型不兼容（length + number、px + % 等）→ 不可求值
+        _ => None,
+    }
+}
+
+/// 乘除：一侧必须为 number（`2 * 3px` / `3px * 2` / `10px / 2`）。除零 → 不可求值。
+fn apply_mul_div(op: char, left: CalcValue, right: CalcValue) -> Option<CalcValue> {
+    let mul = |a: f64, b: f64| a * b;
+    let div = |a: f64, b: f64| a / b;
+    let bin = if op == '*' { mul } else { div };
+    match (left, right) {
+        (CalcValue::Number(a), CalcValue::Number(b)) => {
+            (b != 0.0 || op == '*').then(|| CalcValue::Number(bin(a, b)))
+        }
+        (CalcValue::Dimension(a, u), CalcValue::Number(b)) => {
+            (b != 0.0 || op == '*').then(|| CalcValue::Dimension(bin(a, b), u))
+        }
+        (CalcValue::Percentage(a), CalcValue::Number(b)) => {
+            (b != 0.0 || op == '*').then(|| CalcValue::Percentage(bin(a, b)))
+        }
+        // 乘法交换：number × dimension / percentage
+        (CalcValue::Number(a), CalcValue::Dimension(b, u)) if op == '*' => {
+            Some(CalcValue::Dimension(a * b, u))
+        }
+        (CalcValue::Number(a), CalcValue::Percentage(b)) if op == '*' => {
+            Some(CalcValue::Percentage(a * b))
+        }
+        // 其余组合（dimension × dimension、number / dimension、dimension × % 等）→ 不可求值
+        _ => None,
+    }
+}
+
+/// 跳过连续 whitespace token。
+fn skip_ws(cvs: &[ComponentValue], pos: &mut usize) {
+    while *pos < cvs.len() {
+        if let ComponentValue::PreservedToken(Token::Whitespace) = &cvs[*pos] {
+            *pos += 1;
+        } else {
+            break;
+        }
+    }
+}
+
+/// 窥视当前位置的 delim token（调用前须已 skip_ws），不消费。
+/// 由调用方在确认操作符属于当前层级后自行 `*pos += 1`。
+fn peek_delim(cvs: &[ComponentValue], pos: usize) -> Option<char> {
+    match cvs.get(pos) {
+        Some(ComponentValue::PreservedToken(Token::Delim(c))) => Some(*c),
+        _ => None,
+    }
+}
+
 /// 解析长度维度（相对单位 + 绝对单位 → px）。
 ///
 /// - 相对单位：em/rem/vh/vw/vmin/vmax → px（依赖 ctx 基准）。
@@ -464,6 +662,7 @@ fn resolve_percentage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use muskitty_css::parser::SimpleBlock;
 
     fn dim(value: f64, unit: &str) -> ComponentValue {
         ComponentValue::PreservedToken(Token::Dimension(
@@ -1031,5 +1230,239 @@ mod tests {
             &compute_value("width", &[dim(101.6, "q")], &empty_ctx()),
             96.0,
         );
+    }
+
+    // —— calc() 数值求值（P3-2，CSS Values L4 §9）——
+
+    fn num(value: f64) -> ComponentValue {
+        ComponentValue::PreservedToken(Token::Number(Numeric {
+            value,
+            is_integer: false,
+        }))
+    }
+
+    fn delim(c: char) -> ComponentValue {
+        ComponentValue::PreservedToken(Token::Delim(c))
+    }
+
+    fn ws() -> ComponentValue {
+        ComponentValue::PreservedToken(Token::Whitespace)
+    }
+
+    fn paren(args: Vec<ComponentValue>) -> ComponentValue {
+        ComponentValue::SimpleBlock(SimpleBlock {
+            kind: BlockKind::Paren,
+            value: args,
+        })
+    }
+
+    fn calc_fn(args: Vec<ComponentValue>) -> ComponentValue {
+        ComponentValue::Function(Function {
+            name: "calc".to_string(),
+            value: args,
+        })
+    }
+
+    /// 断言结果是单个 token，值近似 expected，种类为 kind（dimension/number/percentage）。
+    fn assert_single(result: &ComputedValue, expected: f64, kind: &str) {
+        let cvs = result.tokens();
+        assert_eq!(cvs.len(), 1, "expected single token, got {:?}", cvs);
+        match &cvs[0] {
+            ComponentValue::PreservedToken(Token::Dimension(n, u)) => {
+                assert_eq!(kind, "dimension", "expected dimension, got {:?}", cvs[0]);
+                assert!((n.value - expected).abs() < 1e-9, "got {}{}", n.value, u);
+            }
+            ComponentValue::PreservedToken(Token::Number(n)) => {
+                assert_eq!(kind, "number", "expected number, got {:?}", cvs[0]);
+                assert!((n.value - expected).abs() < 1e-9, "got {}", n.value);
+            }
+            ComponentValue::PreservedToken(Token::Percentage(n)) => {
+                assert_eq!(kind, "percentage", "expected percentage, got {:?}", cvs[0]);
+                assert!((n.value - expected).abs() < 1e-9, "got {}%", n.value);
+            }
+            other => panic!("expected {} token, got {:?}", kind, other),
+        }
+    }
+
+    /// 断言结果是保留的 calc() 函数（不可求值场景）。
+    fn assert_calc_kept(result: &ComputedValue) {
+        let cvs = result.tokens();
+        assert_eq!(cvs.len(), 1, "expected single calc fn, got {:?}", cvs);
+        assert!(
+            matches!(
+                &cvs[0],
+                ComponentValue::Function(f) if f.name.eq_ignore_ascii_case("calc")
+            ),
+            "expected calc function, got {:?}",
+            cvs[0]
+        );
+    }
+
+    #[test]
+    fn calc_add_same_units() {
+        // calc(10px + 5px) → 15px
+        let expr = calc_fn(vec![
+            dim(10.0, "px"),
+            ws(),
+            delim('+'),
+            ws(),
+            dim(5.0, "px"),
+        ]);
+        assert_single(
+            &compute_value("width", &[expr], &empty_ctx()),
+            15.0,
+            "dimension",
+        );
+    }
+
+    #[test]
+    fn calc_sub_same_units() {
+        // calc(10px - 5px) → 5px
+        let expr = calc_fn(vec![
+            dim(10.0, "px"),
+            ws(),
+            delim('-'),
+            ws(),
+            dim(5.0, "px"),
+        ]);
+        assert_single(
+            &compute_value("width", &[expr], &empty_ctx()),
+            5.0,
+            "dimension",
+        );
+    }
+
+    #[test]
+    fn calc_mul_by_number() {
+        // calc(2 * 3px) → 6px；calc(3px * 2) → 6px（乘法交换）
+        let expr1 = calc_fn(vec![num(2.0), ws(), delim('*'), ws(), dim(3.0, "px")]);
+        assert_single(
+            &compute_value("width", &[expr1], &empty_ctx()),
+            6.0,
+            "dimension",
+        );
+        let expr2 = calc_fn(vec![dim(3.0, "px"), ws(), delim('*'), ws(), num(2.0)]);
+        assert_single(
+            &compute_value("width", &[expr2], &empty_ctx()),
+            6.0,
+            "dimension",
+        );
+    }
+
+    #[test]
+    fn calc_div_by_number() {
+        // calc(10px / 2) → 5px
+        let expr = calc_fn(vec![dim(10.0, "px"), ws(), delim('/'), ws(), num(2.0)]);
+        assert_single(
+            &compute_value("width", &[expr], &empty_ctx()),
+            5.0,
+            "dimension",
+        );
+    }
+
+    #[test]
+    fn calc_precedence_mul_before_add() {
+        // calc(10px + 5px * 2) → 20px（乘法优先）
+        let expr = calc_fn(vec![
+            dim(10.0, "px"),
+            ws(),
+            delim('+'),
+            ws(),
+            dim(5.0, "px"),
+            ws(),
+            delim('*'),
+            ws(),
+            num(2.0),
+        ]);
+        assert_single(
+            &compute_value("width", &[expr], &empty_ctx()),
+            20.0,
+            "dimension",
+        );
+    }
+
+    #[test]
+    fn calc_paren_group() {
+        // calc((10px + 5px) * 2) → 30px
+        let group = paren(vec![
+            dim(10.0, "px"),
+            ws(),
+            delim('+'),
+            ws(),
+            dim(5.0, "px"),
+        ]);
+        let expr = calc_fn(vec![group, ws(), delim('*'), ws(), num(2.0)]);
+        assert_single(
+            &compute_value("width", &[expr], &empty_ctx()),
+            30.0,
+            "dimension",
+        );
+    }
+
+    #[test]
+    fn calc_number_only() {
+        // calc(10 + 5) → 15（flex-grow 等数字属性）
+        let expr = calc_fn(vec![num(10.0), ws(), delim('+'), ws(), num(5.0)]);
+        assert_single(
+            &compute_value("flex-grow", &[expr], &empty_ctx()),
+            15.0,
+            "number",
+        );
+    }
+
+    #[test]
+    fn calc_percentage_only() {
+        // calc(50% + 25%) → 75%
+        let expr = calc_fn(vec![pct(50.0), ws(), delim('+'), ws(), pct(25.0)]);
+        assert_single(
+            &compute_value("width", &[expr], &empty_ctx()),
+            75.0,
+            "percentage",
+        );
+    }
+
+    #[test]
+    fn calc_mixed_percentage_length_kept() {
+        // calc(100% - 10px)：百分比基准未知 → 不可求值 → 保留 calc 函数
+        let expr = calc_fn(vec![pct(100.0), ws(), delim('-'), ws(), dim(10.0, "px")]);
+        assert_calc_kept(&compute_value("width", &[expr], &empty_ctx()));
+    }
+
+    #[test]
+    fn calc_divide_by_zero_kept() {
+        // calc(10px / 0)：除零 → 不可求值 → 保留 calc 函数
+        let expr = calc_fn(vec![dim(10.0, "px"), ws(), delim('/'), ws(), num(0.0)]);
+        assert_calc_kept(&compute_value("width", &[expr], &empty_ctx()));
+    }
+
+    #[test]
+    fn calc_incompatible_types_kept() {
+        // calc(10px + 5)：length + number → 不可求值 → 保留
+        let expr = calc_fn(vec![dim(10.0, "px"), ws(), delim('+'), ws(), num(5.0)]);
+        assert_calc_kept(&compute_value("width", &[expr], &empty_ctx()));
+    }
+
+    #[test]
+    fn calc_dimension_times_dimension_kept() {
+        // calc(10px * 2px)：dimension × dimension → 不可求值 → 保留
+        let expr = calc_fn(vec![
+            dim(10.0, "px"),
+            ws(),
+            delim('*'),
+            ws(),
+            dim(2.0, "px"),
+        ]);
+        assert_calc_kept(&compute_value("width", &[expr], &empty_ctx()));
+    }
+
+    #[test]
+    fn calc_relative_units_resolved_before_eval() {
+        // calc(2em + 3px)：em 先归一到 px（父 font-size=20px → 40px）→ 43px
+        let ctx = ComputeContext {
+            parent_font_size: 20.0,
+            ..empty_ctx()
+        };
+        let expr = calc_fn(vec![dim(2.0, "em"), ws(), delim('+'), ws(), dim(3.0, "px")]);
+        assert_single(&compute_value("width", &[expr], &ctx), 43.0, "dimension");
     }
 }

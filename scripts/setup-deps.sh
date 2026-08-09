@@ -11,6 +11,8 @@
 #                    → muskitty-dom (path)
 #                    → muskitty-selectors (path) → muskitty-css (+ parser + tokenizer)
 #                                                 → muskitty-dom (path)
+#   [dev-dep] muskitty-html5-parser (path) → muskitty-dom
+#                                         → muskitty-html5-tokenizer (path)
 #
 # All path deps are independent repos under muskitty-dev/.
 #
@@ -42,3 +44,5 @@ clone_if_absent https://github.com/muskitty-dev/muskitty-css-tokenizer.git ../mu
 clone_if_absent https://github.com/muskitty-dev/muskitty-cssom.git ../muskitty-cssom
 clone_if_absent https://github.com/muskitty-dev/muskitty-dom.git ../muskitty-dom
 clone_if_absent https://github.com/muskitty-dev/muskitty-selectors.git ../muskitty-selectors
+clone_if_absent https://github.com/muskitty-dev/muskitty-html5-parser.git ../muskitty-html5-parser
+clone_if_absent https://github.com/muskitty-dev/muskitty-html5-tokenizer.git ../muskitty-html5-tokenizer

@@ -476,6 +476,37 @@ pub static BUILTIN_PROPERTIES: &[PropertyDefinition] = &[
         inherited: false,
         percentages: PercentageBasis::None,
     },
+    // —— Grid 属性（CSS Grid Layout Level 1 §7）——
+    PropertyDefinition {
+        name: "grid-template-columns",
+        initial_value: "none",
+        inherited: false,
+        percentages: PercentageBasis::None,
+    },
+    PropertyDefinition {
+        name: "grid-template-rows",
+        initial_value: "none",
+        inherited: false,
+        percentages: PercentageBasis::None,
+    },
+    PropertyDefinition {
+        name: "grid-auto-flow",
+        initial_value: "row",
+        inherited: false,
+        percentages: PercentageBasis::None,
+    },
+    PropertyDefinition {
+        name: "grid-auto-columns",
+        initial_value: "auto",
+        inherited: false,
+        percentages: PercentageBasis::None,
+    },
+    PropertyDefinition {
+        name: "grid-auto-rows",
+        initial_value: "auto",
+        inherited: false,
+        percentages: PercentageBasis::None,
+    },
 ];
 
 /// 查找属性定义。返回 `None` 表示属性未注册。

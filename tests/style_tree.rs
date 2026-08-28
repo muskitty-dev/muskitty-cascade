@@ -213,8 +213,53 @@ fn invalid_var_treats_property_as_unset() {
     );
 }
 
-/// 与 run 相同，但复用已解析的 DOM（避免重复解析）。
+/// 复用已解析的 DOM（避免重复解析），用默认视口（1920×1080）。
 fn run_from_dom(dom: &Rc<RefCell<Node>>, css: &str) -> HashMap<usize, ComputedStyle> {
+    run_from_dom_opts(dom, css, &StyleTreeOptions::default())
+}
+
+/// 同 [`run_from_dom`]，但指定视口选项（media query 求值用）。
+fn run_from_dom_opts(
+    dom: &Rc<RefCell<Node>>,
+    css: &str,
+    options: &StyleTreeOptions,
+) -> HashMap<usize, ComputedStyle> {
     let sheet = author_sheet(css);
-    compute_styles(dom, &[sheet], &StyleTreeOptions::default())
+    compute_styles(dom, &[sheet], options)
+}
+
+// —— M-3: media 视口接线 ——
+
+#[test]
+fn media_min_width_applies_at_wide_viewport() {
+    // StyleTreeOptions::default() 视口 1920×1080 → (min-width:800px) 命中
+    let dom = parse_dom(r#"<html><body><div id="a"></div></body></html>"#);
+    let styles = run_from_dom(&dom, "@media (min-width: 800px) { div { color: red } }");
+    let a = element_with_id(&dom, "a");
+    assert_eq!(
+        style_ident(styles.get(&addr(&a)).unwrap(), "color"),
+        "red",
+        "默认 1920 视口应命中 (min-width:800px)"
+    );
+}
+
+#[test]
+fn media_min_width_pruned_at_narrow_viewport() {
+    // 640 视口 → (min-width:800px) 剪枝，color 回退初始值 black
+    let dom = parse_dom(r#"<html><body><div id="a"></div></body></html>"#);
+    let opts = StyleTreeOptions {
+        viewport_width: 640.0,
+        viewport_height: 480.0,
+    };
+    let styles = run_from_dom_opts(
+        &dom,
+        "@media (min-width: 800px) { div { color: red } }",
+        &opts,
+    );
+    let a = element_with_id(&dom, "a");
+    assert_eq!(
+        style_ident(styles.get(&addr(&a)).unwrap(), "color"),
+        "black",
+        "640 视口应剪枝 (min-width:800px)，color 取初始值"
+    );
 }

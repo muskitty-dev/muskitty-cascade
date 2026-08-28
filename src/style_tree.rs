@@ -20,7 +20,9 @@ use crate::cascade::{cascade_for_element, cascade_winner};
 use crate::compute::{compute_value_with, ComputeContext, CustomPropertySource};
 use crate::custom_properties::is_css_wide_keyword;
 use crate::defaulting::apply_defaulting;
-use crate::filter::{collect_declared_values_prepared, prepare_sheets, PreparedSheets};
+use crate::filter::{
+    collect_declared_values_prepared, prepare_sheets_with_context, MediaContext, PreparedSheets,
+};
 use crate::registry::BUILTIN_PROPERTIES;
 use crate::style::{ComputedStyle, ComputedValue, DeclaredValue};
 use muskitty_css::parser::ComponentValue;
@@ -68,7 +70,14 @@ pub fn compute_styles(
     options: &StyleTreeOptions,
 ) -> HashMap<usize, ComputedStyle> {
     // PERF-1: 选择器解析一次，整树每个元素复用 prepared sheets。
-    let prepared = prepare_sheets(sheets);
+    // media query 求值以调用方视口为准（MediaContext::default() 亦为 1920×1080，
+    // 与 StyleTreeOptions::default() 一致 → 默认行为不变）。
+    let media = MediaContext {
+        media_type: "screen",
+        viewport_w: options.viewport_width as f32,
+        viewport_h: options.viewport_height as f32,
+    };
+    let prepared = prepare_sheets_with_context(sheets, &media);
     let mut styles = HashMap::new();
     walk(
         root,

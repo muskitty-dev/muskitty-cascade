@@ -470,6 +470,8 @@ fn expand_shorthand(
         Some(expand_font(value))
     } else if name.eq_ignore_ascii_case("gap") {
         Some(expand_gap(value))
+    } else if name.eq_ignore_ascii_case("border") {
+        Some(expand_border(value))
     } else {
         None
     }
@@ -660,6 +662,120 @@ fn expand_font(value: &[ComponentValue]) -> Vec<(&'static str, Vec<ComponentValu
 fn expand_gap(value: &[ComponentValue]) -> Vec<(&'static str, Vec<ComponentValue>)> {
     let (row, col) = split_gap_value(value);
     vec![("row-gap", row), ("column-gap", col)]
+}
+
+/// `border` 简写中 `<line-width>` 关键字集合（CSS Backgrounds & Borders L3 §4.3）。
+const BORDER_WIDTH_KEYWORDS: &[&str] = &["thin", "medium", "thick"];
+
+/// `border` 简写中 `<line-style>` 关键字集合（CSS Backgrounds & Borders L3 §4.2）。
+const BORDER_STYLE_KEYWORDS: &[&str] = &[
+    "none", "hidden", "dotted", "dashed", "solid", "double", "groove", "ridge", "inset", "outset",
+];
+
+/// 是否为 `<line-width>` 分量：长度（任意单位）/ number 0 / thin/medium/thick。
+fn is_border_width(cv: &ComponentValue) -> bool {
+    match cv {
+        ComponentValue::PreservedToken(Token::Dimension(..)) => true,
+        ComponentValue::PreservedToken(Token::Number(_)) => number_of(cv) == Some(0.0),
+        ComponentValue::PreservedToken(Token::Ident(s)) => BORDER_WIDTH_KEYWORDS
+            .iter()
+            .any(|k| s.eq_ignore_ascii_case(k)),
+        _ => false,
+    }
+}
+
+/// 是否为 `<line-style>` 分量。
+fn is_border_style(cv: &ComponentValue) -> bool {
+    matches!(
+        cv,
+        ComponentValue::PreservedToken(Token::Ident(s))
+            if BORDER_STYLE_KEYWORDS.iter().any(|k| s.eq_ignore_ascii_case(k))
+    )
+}
+
+/// 是否为颜色分量：hash / 颜色函数 / 非 width·非 style 关键字的 ident。
+///
+/// 反集法（同 `is_background_color`）：width/style 关键字集合已封闭（即 border
+/// 语法中仅有的 ident 关键字），其余 ident 即颜色名（red/currentcolor/…）。
+/// 不复用 `is_background_color`——其反集含 "none"，是合法 `<line-style>`。
+fn is_border_color(cv: &ComponentValue) -> bool {
+    match cv {
+        ComponentValue::PreservedToken(Token::Hash(..)) => true,
+        ComponentValue::PreservedToken(Token::Ident(s)) => {
+            !BORDER_WIDTH_KEYWORDS
+                .iter()
+                .any(|k| s.eq_ignore_ascii_case(k))
+                && !BORDER_STYLE_KEYWORDS
+                    .iter()
+                    .any(|k| s.eq_ignore_ascii_case(k))
+        }
+        ComponentValue::Function(f) => {
+            f.name.eq_ignore_ascii_case("rgb")
+                || f.name.eq_ignore_ascii_case("rgba")
+                || f.name.eq_ignore_ascii_case("hsl")
+                || f.name.eq_ignore_ascii_case("hsla")
+                || f.name.eq_ignore_ascii_case("hwb")
+                || f.name.eq_ignore_ascii_case("lab")
+                || f.name.eq_ignore_ascii_case("lch")
+                || f.name.eq_ignore_ascii_case("oklab")
+                || f.name.eq_ignore_ascii_case("oklch")
+                || f.name.eq_ignore_ascii_case("color")
+        }
+        _ => false,
+    }
+}
+
+/// `border` 简写（CSS Backgrounds & Borders L3 §4.4）。
+///
+/// `border: <line-width> || <line-style> || <color>`：顺序无关、每类至多一次，
+/// 重复或无法分类 → 无效（返回空，声明丢弃）。缺失类别取注册表初始值
+/// （medium / none / currentcolor，见 registry.rs）。显式补全三个 longhand——
+/// renderer `extract_border` 逐条读取，漏发 border-width 会因默认 "medium"
+/// ident 无法解析成 px 而无边框。单全局关键字 → 三个长属性均取该关键字。
+fn expand_border(value: &[ComponentValue]) -> Vec<(&'static str, Vec<ComponentValue>)> {
+    if let Some(kw) = single_global_keyword(value) {
+        return ["border-width", "border-style", "border-color"]
+            .iter()
+            .map(|p| (*p, vec![ident_token(&kw)]))
+            .collect();
+    }
+    let mut width: Option<ComponentValue> = None;
+    let mut style: Option<ComponentValue> = None;
+    let mut color: Option<ComponentValue> = None;
+    for cv in non_ws_parts(value) {
+        if is_border_width(cv) {
+            if width.is_some() {
+                return vec![];
+            }
+            width = Some((*cv).clone());
+        } else if is_border_style(cv) {
+            if style.is_some() {
+                return vec![];
+            }
+            style = Some((*cv).clone());
+        } else if is_border_color(cv) {
+            if color.is_some() {
+                return vec![];
+            }
+            color = Some((*cv).clone());
+        } else {
+            return vec![]; // 无法分类 → 无效
+        }
+    }
+    vec![
+        (
+            "border-width",
+            vec![width.unwrap_or_else(|| ident_token("medium"))],
+        ),
+        (
+            "border-style",
+            vec![style.unwrap_or_else(|| ident_token("none"))],
+        ),
+        (
+            "border-color",
+            vec![color.unwrap_or_else(|| ident_token("currentcolor"))],
+        ),
+    ]
 }
 
 /// 取非空白分量（借用）。

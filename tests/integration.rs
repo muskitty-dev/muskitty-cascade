@@ -758,3 +758,117 @@ fn font_shorthand_does_not_emit_font() {
     assert!(!props.contains(&"font"), "font should be expanded away");
     assert!(props.contains(&"font-size"));
 }
+
+// —— border 简写（CSS Backgrounds & Borders L3 §4.4）——
+
+#[test]
+fn border_shorthand_full_expands() {
+    // border: <width> <style> <color> → 三个通用 longhand
+    let element = make_element("div", &[]);
+    let sheet = make_sheet("div { border: 1px solid red; }", Origin::Author);
+    assert_tok_dim(&winner_tokens(&element, &sheet, "border-width"), 1.0, "px");
+    assert_tok_ident(&winner_tokens(&element, &sheet, "border-style"), "solid");
+    assert_tok_ident(&winner_tokens(&element, &sheet, "border-color"), "red");
+}
+
+#[test]
+fn border_shorthand_order_independent() {
+    // || 组合：顺序无关
+    let element = make_element("div", &[]);
+    let sheet = make_sheet("div { border: red 1px solid; }", Origin::Author);
+    assert_tok_dim(&winner_tokens(&element, &sheet, "border-width"), 1.0, "px");
+    assert_tok_ident(&winner_tokens(&element, &sheet, "border-style"), "solid");
+    assert_tok_ident(&winner_tokens(&element, &sheet, "border-color"), "red");
+}
+
+#[test]
+fn border_shorthand_partial_defaults() {
+    // 仅 style → width/color 补注册表初始值
+    let element = make_element("div", &[]);
+    let sheet = make_sheet("div { border: solid; }", Origin::Author);
+    assert_tok_ident(&winner_tokens(&element, &sheet, "border-width"), "medium");
+    assert_tok_ident(&winner_tokens(&element, &sheet, "border-style"), "solid");
+    assert_tok_ident(
+        &winner_tokens(&element, &sheet, "border-color"),
+        "currentcolor",
+    );
+}
+
+#[test]
+fn border_shorthand_no_width_style_defaults() {
+    // 仅 color → width/style 补初始值
+    let element = make_element("div", &[]);
+    let sheet = make_sheet("div { border: red; }", Origin::Author);
+    assert_tok_ident(&winner_tokens(&element, &sheet, "border-width"), "medium");
+    assert_tok_ident(&winner_tokens(&element, &sheet, "border-style"), "none");
+    assert_tok_ident(&winner_tokens(&element, &sheet, "border-color"), "red");
+}
+
+#[test]
+fn border_shorthand_zero_width() {
+    // number 0 是合法 <line-width>
+    let element = make_element("div", &[]);
+    let sheet = make_sheet("div { border: 0 solid red; }", Origin::Author);
+    assert_tok_number(&winner_tokens(&element, &sheet, "border-width"), 0.0);
+    assert_tok_ident(&winner_tokens(&element, &sheet, "border-style"), "solid");
+    assert_tok_ident(&winner_tokens(&element, &sheet, "border-color"), "red");
+}
+
+#[test]
+fn border_shorthand_hash_color() {
+    let element = make_element("div", &[]);
+    let sheet = make_sheet("div { border: 1px solid #ff0000; }", Origin::Author);
+    let toks = winner_tokens(&element, &sheet, "border-color");
+    assert_eq!(toks.len(), 1, "expected single token, got {:?}", toks);
+    assert!(
+        matches!(
+            &toks[0],
+            muskitty_css::parser::ComponentValue::PreservedToken(Token::Hash(..))
+        ),
+        "expected Hash, got {:?}",
+        toks[0]
+    );
+}
+
+#[test]
+fn border_shorthand_duplicate_category_invalid() {
+    // 两个 width → 无效简写 → 不产出任何 longhand
+    let element = make_element("div", &[]);
+    let sheet = make_sheet("div { border: 1px 2px; }", Origin::Author);
+    assert!(winner_tokens(&element, &sheet, "border-width").is_empty());
+    assert!(winner_tokens(&element, &sheet, "border-style").is_empty());
+    assert!(winner_tokens(&element, &sheet, "border-color").is_empty());
+}
+
+#[test]
+fn border_shorthand_invalid_component_dropped() {
+    // number 2 不是合法 width（非 0）→ 无法分类 → 无效
+    let element = make_element("div", &[]);
+    let sheet = make_sheet("div { border: 2; }", Origin::Author);
+    assert!(winner_tokens(&element, &sheet, "border-width").is_empty());
+    assert!(winner_tokens(&element, &sheet, "border-style").is_empty());
+    assert!(winner_tokens(&element, &sheet, "border-color").is_empty());
+}
+
+#[test]
+fn border_shorthand_global_keyword_expands() {
+    // 单全局关键字 → 三个 longhand 均取该关键字
+    let element = make_element("div", &[]);
+    let sheet = make_sheet("div { border: inherit; }", Origin::Author);
+    assert_tok_ident(&winner_tokens(&element, &sheet, "border-width"), "inherit");
+    assert_tok_ident(&winner_tokens(&element, &sheet, "border-style"), "inherit");
+    assert_tok_ident(&winner_tokens(&element, &sheet, "border-color"), "inherit");
+}
+
+#[test]
+fn border_shorthand_does_not_emit_border() {
+    // border 展开后不应保留 border 本体
+    let element = make_element("div", &[]);
+    let sheet = make_sheet("div { border: 1px solid red; }", Origin::Author);
+    let declared = collect_declared_values(&element, &[sheet]);
+    let props: Vec<&str> = declared.iter().map(|d| d.property.as_str()).collect();
+    assert!(!props.contains(&"border"), "border should be expanded away");
+    assert!(props.contains(&"border-width"));
+    assert!(props.contains(&"border-style"));
+    assert!(props.contains(&"border-color"));
+}

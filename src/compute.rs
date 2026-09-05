@@ -175,11 +175,23 @@ enum ResolvedVar {
 /// var(--v{i-1})` 这类重复引用链，输出规模 2^N 是语义使然，但每级只展开
 /// 一次 —— 时间线性于输出规模，不再按 N×2^N 指数重复递归（修复前实测
 /// N=22 需 30.9s）。
+///
+/// 审计 F-2：环检测不约束**线性链**（`--v1: var(--v2); --v2: var(--v3); …`
+/// 每链约 4 帧，2 万条即栈溢出 abort），且语法解析器的 `MAX_NESTING_DEPTH`
+/// 不适用——每个自定义属性值都是深度 1 的平坦 token 列表。`depth` 计数
+/// var() 引用嵌套（含 fallback 内引用），超 [`MAX_VAR_DEPTH`] 按环同语义
+/// 处理（guaranteed-invalid → fallback / Err，css-variables-1 §3.1）。
 struct VarResolver<'a> {
     ctx: &'a ComputeContext<'a>,
     resolved: HashMap<String, ResolvedVar>,
     in_progress: HashSet<String>,
+    /// 当前 var() 引用嵌套深度（F-2）。
+    depth: usize,
 }
+
+/// var() 解析最大引用嵌套深度（审计 F-2）。真实样式表的 var() 链极少
+/// 超过个位数；32 已远超合理使用，仅拦截敌意输入。
+const MAX_VAR_DEPTH: usize = 32;
 
 impl<'a> VarResolver<'a> {
     fn new(ctx: &'a ComputeContext<'a>) -> Self {
@@ -187,6 +199,7 @@ impl<'a> VarResolver<'a> {
             ctx,
             resolved: HashMap::new(),
             in_progress: HashSet::new(),
+            depth: 0,
         }
     }
 
@@ -252,8 +265,9 @@ impl<'a> VarResolver<'a> {
 
     /// 解析单个 var() 引用。
     ///
-    /// 被引用的自定义属性 guaranteed-invalid（环、未定义、值含无效 var()）时：
-    /// 有 fallback 则递归解析 fallback（P1-2），无 fallback 则 `Err`。
+    /// 被引用的自定义属性 guaranteed-invalid（环、未定义、值含无效 var()、
+    /// 引用嵌套超 [`MAX_VAR_DEPTH`]）时：有 fallback 则递归解析 fallback
+    /// （P1-2），无 fallback 则 `Err`。
     fn resolve_var_ref(
         &mut self,
         name: &str,
@@ -267,16 +281,22 @@ impl<'a> VarResolver<'a> {
         if let Some(rv) = cached {
             return self.materialize(rv, fallback, property);
         }
+        // 深度超限（F-2）：先于 gray 标记检查，按环同语义处理。
+        if self.depth >= MAX_VAR_DEPTH {
+            return self.resolve_fallback(fallback, property);
+        }
         // gray：DFS 栈命中 → 环。该 var() 视为 guaranteed-invalid（P1-2）。
         if !self.in_progress.insert(name.to_string()) {
             return self.resolve_fallback(fallback, property);
         }
 
         // 首次解析：求值该变量的值（可能含嵌套 var()）。
+        self.depth += 1;
         let result = match ctx.custom_properties.get(name) {
             Some(value) => self.resolve_tokens(value, property),
             None => Err(()), // 未定义 → guaranteed-invalid
         };
+        self.depth -= 1;
         self.in_progress.remove(name);
 
         let rv = match result {
@@ -991,6 +1011,65 @@ mod tests {
         assert_eq!(cvs.len(), 1);
         match &cvs[0] {
             ComponentValue::PreservedToken(Token::Ident(s)) => assert_eq!(s, "red"),
+            other => panic!("expected Ident, got {:?}", other),
+        }
+    }
+
+    // —— F-2: var() 引用深度上限（线性链栈溢出 DoS）——
+
+    fn linear_var_chain(props: &mut HashMap<String, Vec<ComponentValue>>, n: usize) {
+        // 构造 --v0: var(--v1); …; --v{n-1}: var(--v{n})（--v{n} 未定义）。
+        for i in 0..n {
+            props.insert(format!("--v{i}"), vec![var_fn(&format!("--v{}", i + 1))]);
+        }
+    }
+
+    #[test]
+    fn var_deep_chain_exceeding_depth_limit_is_invalid_not_overflow() {
+        // 2 万条线性链：修复前每链 ~4 帧 → 栈溢出 abort；修复后超
+        // MAX_VAR_DEPTH 按环同语义处理（无 fallback → invalid → 空）。
+        let mut props = HashMap::new();
+        linear_var_chain(&mut props, 20_000);
+        let ctx = ctx_with_custom(&props);
+        let result = compute_value("color", &[var_fn("--v0")], &ctx);
+        assert!(
+            result.tokens().is_empty(),
+            "chain deeper than MAX_VAR_DEPTH must be invalid"
+        );
+    }
+
+    #[test]
+    fn var_chain_within_depth_limit_still_resolves() {
+        // 深度 16 的链 + 终值 → 正常解析，不受上限影响。
+        let mut props = HashMap::new();
+        linear_var_chain(&mut props, 16);
+        props.insert(
+            "--v16".to_string(),
+            vec![ComponentValue::PreservedToken(Token::Ident(
+                "red".to_string(),
+            ))],
+        );
+        let ctx = ctx_with_custom(&props);
+        let result = compute_value("color", &[var_fn("--v0")], &ctx);
+        let cvs = result.tokens();
+        assert_eq!(cvs.len(), 1);
+        match &cvs[0] {
+            ComponentValue::PreservedToken(Token::Ident(s)) => assert_eq!(s, "red"),
+            other => panic!("expected Ident, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn var_deep_chain_with_fallback_resolves_to_fallback() {
+        // 超限链带 fallback → fallback 生效（guaranteed-invalid 走 P1-2 路径）。
+        let mut props = HashMap::new();
+        linear_var_chain(&mut props, 100);
+        let ctx = ctx_with_custom(&props);
+        let result = compute_value("color", &[var_fn_fb("--v0", "blue")], &ctx);
+        let cvs = result.tokens();
+        assert_eq!(cvs.len(), 1);
+        match &cvs[0] {
+            ComponentValue::PreservedToken(Token::Ident(s)) => assert_eq!(s, "blue"),
             other => panic!("expected Ident, got {:?}", other),
         }
     }

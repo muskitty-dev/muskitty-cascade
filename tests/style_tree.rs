@@ -296,9 +296,7 @@ fn css_wide_keywords_default_not_shared() {
 /// 继承属性取父 computed 值（此前由"全属性盲算"逐 token 物化）。
 #[test]
 fn undeclared_properties_fill_initial_and_parent() {
-    let dom = parse_dom(
-        r#"<html style="white-space: pre"><body><div id="a"></div></body></html>"#,
-    );
+    let dom = parse_dom(r#"<html style="white-space: pre"><body><div id="a"></div></body></html>"#);
     let styles = run_from_dom(&dom, "");
     let a = element_with_id(&dom, "a");
     let cs = styles.get(&addr(&a)).unwrap();

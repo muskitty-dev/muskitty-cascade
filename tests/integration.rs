@@ -50,7 +50,7 @@ fn compute_property(
     let group: &[muskitty_cascade::DeclaredValue] =
         groups.get(property).map(|g| g.as_slice()).unwrap_or(&[]);
     let winner = cascade_winner(group);
-    let cascaded = winner.map(|w| w.value.as_slice());
+    let cascaded = winner.map(|w| w.value.as_ref());
     let specified = apply_defaulting(property, cascaded, parent_computed);
     // 单态化（P2-20）：defaulting 产物与原始声明统一为 token 序列，直接
     // 计算（幂等），不再区分 Raw/Keyword 来源。
@@ -417,7 +417,7 @@ fn winner_tokens(
         .get(property)
         .map(|v| v.as_slice())
         .and_then(cascade_winner)
-        .map(|d| d.value.clone())
+        .map(|d| d.value.to_vec())
         .unwrap_or_default()
 }
 

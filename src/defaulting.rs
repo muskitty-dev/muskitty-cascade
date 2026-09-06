@@ -104,6 +104,29 @@ fn extract_single_ident(cvs: &[ComponentValue]) -> Option<String> {
     found
 }
 
+/// 值是否为会触发 defaulting 改写的 CSS-wide 关键字（§7.3）。
+///
+/// 与 [`apply_defaulting`] 的 match 分支同集：`initial`/`inherit`/`unset`/
+/// `revert`/`revert-layer`（五者，含 revert-layer）。供
+/// [`crate::style_tree`] 的快速路径判定——命中则不可直享声明值，必须走
+/// defaulting。零分配（大小写不敏感逐字比较）。
+pub(crate) fn is_defaulting_keyword(value: &[ComponentValue]) -> bool {
+    let mut iter = value
+        .iter()
+        .filter(|cv| !matches!(cv, ComponentValue::PreservedToken(Token::Whitespace)));
+    match iter.next() {
+        Some(ComponentValue::PreservedToken(Token::Ident(s))) => {
+            iter.next().is_none()
+                && (s.eq_ignore_ascii_case("initial")
+                    || s.eq_ignore_ascii_case("inherit")
+                    || s.eq_ignore_ascii_case("unset")
+                    || s.eq_ignore_ascii_case("revert")
+                    || s.eq_ignore_ascii_case("revert-layer"))
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

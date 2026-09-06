@@ -263,3 +263,79 @@ fn media_min_width_pruned_at_narrow_viewport() {
         "640 视口应剪枝 (min-width:800px)，color 取初始值"
     );
 }
+
+// —— CAS-2/3: compute_one 快速路径回归 ——
+
+/// CSS-wide 关键字（含 revert-layer）不得被"免解析直享"快速路径短路成
+/// 字面量——必须走 defaulting 改写：继承属性当 inherit（取父值）、
+/// 非继承属性当 initial。快速路径判定若漏掉任一关键字（如 revert-layer），
+/// 本测试即失败（computed 值变成字面量 ident）。
+#[test]
+fn css_wide_keywords_default_not_shared() {
+    let dom = parse_dom(
+        r#"<html style="color: red"><body><div id="a" style="color: revert-layer; display: revert"></div></body></html>"#,
+    );
+    let styles = run_from_dom(&dom, "");
+    let a = element_with_id(&dom, "a");
+    let cs = styles.get(&addr(&a)).unwrap();
+    // color（继承）: revert-layer → unset → 继承父值 red，非字面量。
+    assert_eq!(
+        style_ident(cs, "color"),
+        "red",
+        "revert-layer on inherited property must default to parent value"
+    );
+    // display（非继承）: revert → initial → inline，非字面量。
+    assert_eq!(
+        style_ident(cs, "display"),
+        "inline",
+        "revert on non-inherited property must default to initial value"
+    );
+}
+
+/// 未声明属性经快速路径直填后的语义不变：非继承属性取 initial 常量，
+/// 继承属性取父 computed 值（此前由"全属性盲算"逐 token 物化）。
+#[test]
+fn undeclared_properties_fill_initial_and_parent() {
+    let dom = parse_dom(
+        r#"<html style="white-space: pre"><body><div id="a"></div></body></html>"#,
+    );
+    let styles = run_from_dom(&dom, "");
+    let a = element_with_id(&dom, "a");
+    let cs = styles.get(&addr(&a)).unwrap();
+    // 非继承 + 未声明 → initial（overflow: visible）。
+    assert_eq!(
+        style_ident(cs, "overflow"),
+        "visible",
+        "undeclared non-inherited property must fill initial constant"
+    );
+    // 继承 + 未声明 → 父 computed 值（white-space: pre）。
+    assert_eq!(
+        style_ident(cs, "white-space"),
+        "pre",
+        "undeclared inherited property must take parent computed value"
+    );
+}
+
+/// 免解析直享（CAS-2 快速路径 2）对普通声明值的结果与完整路径一致：
+/// token 序列原样进入 computed 值。
+#[test]
+fn plain_declared_value_computes_identically() {
+    let dom = parse_dom(
+        r#"<html><body><div id="a" style="color: rgb(0, 0, 255); margin-left: 10px"></div></body></html>"#,
+    );
+    let styles = run_from_dom(&dom, "");
+    let a = element_with_id(&dom, "a");
+    let cs = styles.get(&addr(&a)).unwrap();
+    // 函数值（rgb）走完整解析路径，token 保持函数形态。
+    let color = cs.get("color").unwrap();
+    assert!(
+        color.tokens().iter().any(|cv| matches!(
+            cv,
+            ComponentValue::Function(f) if f.name.eq_ignore_ascii_case("rgb")
+        )),
+        "rgb() must stay a function token, got {:?}",
+        color.tokens()
+    );
+    // 绝对单位 px 值原样保留。
+    assert_eq!(style_px(cs, "margin-left"), 10.0);
+}

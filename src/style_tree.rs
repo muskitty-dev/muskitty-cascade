@@ -17,13 +17,15 @@
 //! font-size（先字体后其余属性，em 语义 = 元素自身 font-size）。
 
 use crate::cascade::{cascade_for_element, cascade_winner};
-use crate::compute::{compute_value_with, ComputeContext, CustomPropertySource};
+use crate::compute::{
+    compute_value_with, needs_no_resolution, ComputeContext, CustomPropertySource,
+};
 use crate::custom_properties::is_css_wide_keyword;
-use crate::defaulting::apply_defaulting;
+use crate::defaulting::{apply_defaulting, is_defaulting_keyword};
 use crate::filter::{
     collect_declared_values_prepared, prepare_sheets_with_context, MediaContext, PreparedSheets,
 };
-use crate::registry::BUILTIN_PROPERTIES;
+use crate::registry::{lookup_property, PropertyDefinition, BUILTIN_PROPERTIES};
 use crate::style::{ComputedStyle, ComputedValue, DeclaredValue};
 use muskitty_css::parser::ComponentValue;
 use muskitty_css::tokenizer::{Numeric, Token};
@@ -33,6 +35,7 @@ use muskitty_selectors::matching::DomElement;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::{Arc, OnceLock};
 
 /// 浏览器默认 font-size（px）。CSS 初始值 `medium` = 16px。
 const DEFAULT_FONT_SIZE: f64 = 16.0;
@@ -148,7 +151,6 @@ fn walk<'a>(
         options,
         &source,
     );
-    styles.insert(addr, cs);
 
     // 根元素自身计算 font-size 后，其 px 成为子树 rem 基准。
     let child_root_fs = if root_font_size.is_none() {
@@ -156,7 +158,8 @@ fn walk<'a>(
     } else {
         root_font_size
     };
-    let parent_cs = styles.get(&addr).cloned();
+    // CAS-1：不再整表克隆父 ComputedStyle——先持局部 `cs` 的引用递归子树，
+    // 递归返回后再入表。styles 在子树遍历期间只写不读，借用无冲突。
     let children: Vec<Rc<RefCell<Node>>> = node.borrow().child_nodes().to_vec();
     for child in &children {
         walk(
@@ -164,12 +167,13 @@ fn walk<'a>(
             prepared,
             options,
             Some(&source),
-            parent_cs.as_ref(),
+            Some(&cs),
             own_font_size,
             child_root_fs,
             styles,
         );
     }
+    styles.insert(addr, cs);
 }
 
 /// 从 cascade 分组派生本元素自己的 `--*` 表（不含继承）。
@@ -188,7 +192,9 @@ fn derive_own_custom_props(
                 // P2-4：CSS-wide 关键字（initial/inherit/unset/revert）不写入，
                 // 避免 var() 替换出字面量关键字。
                 if !is_css_wide_keyword(&winner.value) {
-                    props.insert(name.clone(), winner.value.clone());
+                    // CAS-2：DeclaredValue.value 已 Arc 化；本表仍为 Vec
+                    //（每元素一次浅转，自定义属性通常少量）。
+                    props.insert(name.clone(), winner.value.to_vec());
                 }
             }
         }
@@ -263,6 +269,20 @@ fn compute_element_style<'a>(
 /// 值含无效 var()（`Err`）时按 unset 处理（css-variables-1 §3.1：
 /// invalid at computed-value time）：继承属性取父值、非继承属性取初始值
 /// —— 与未声明的 `apply_defaulting(property, None, parent)` 等价（P2-5）。
+///
+/// # CAS-2/3 快速路径
+///
+/// 完整路径对每属性做两次逐 token 物化（defaulting 的 `to_vec` +
+/// `resolve_tokens` 的 `out`）。两条快速路径依上述幂等性跳过：
+///
+/// 1. **无胜者（未声明）**——继承属性取父 computed 值的 Arc 克隆
+///    （幂等重算结果相同）；无父值（根元素）与非继承属性取
+///    [`INITIAL_COMPUTED`] 预生成常量（compute 对关键字/数字 token
+///    恒等）。整树路径未声明属性不再逐 token 物化（原"全属性盲算"）。
+/// 2. **胜出声明免解析直享**——值非 CSS-wide 关键字
+///    （[`is_defaulting_keyword`]，defaulting 需改写）且无需解析
+///    （[`needs_no_resolution`]，无 var()/可换算单位/函数）时
+///    compute 恒等，直接共享声明值 Arc。
 fn compute_one(
     property: &str,
     groups: &HashMap<String, Vec<DeclaredValue>>,
@@ -270,13 +290,51 @@ fn compute_one(
     ctx: &ComputeContext,
 ) -> ComputedValue {
     let winner = groups.get(property).and_then(|g| cascade_winner(g));
-    let cascaded = winner.map(|w| w.value.as_slice());
     let parent_value = parent_style.and_then(|ps| ps.get(property));
-    let specified = apply_defaulting(property, cascaded, parent_value);
+
+    // 快速路径 1：未声明（无胜者）——defaulting 产物免 compute。
+    let Some(winner) = winner else {
+        return match (lookup_property(property), parent_value) {
+            (Some(def), Some(pv)) if def.inherited => pv.clone(),
+            (Some(def), _) => initial_computed(def),
+            // 未注册属性保持原语义（initial 兜底关键字）。
+            (None, _) => apply_defaulting(property, None, parent_value),
+        };
+    };
+
+    // 快速路径 2：胜出声明免解析直享（Arc 共享，零深拷贝）。
+    if !is_defaulting_keyword(&winner.value) && needs_no_resolution(&winner.value, property) {
+        return ComputedValue::from_arc(Arc::clone(&winner.value));
+    }
+
+    // 完整路径：defaulting（CSS-wide 关键字/继承/初始值）→ compute。
+    let specified = apply_defaulting(property, Some(&winner.value), parent_value);
     match compute_value_with(property, specified.tokens(), ctx) {
         Ok(computed) => computed,
         Err(()) => apply_defaulting(property, None, parent_value),
     }
+}
+
+/// CAS-3：内建属性 initial 值的预生成 [`ComputedValue`] 常量表。
+///
+/// 内建 initial 值均为关键字/数字 token（registry 全表无单位/百分比/
+/// 函数），compute 对其恒等（[`needs_no_resolution`]），故未声明的非
+/// 继承属性（及无父值的继承属性）直接共享同一 Arc 实例——零计算、
+/// 零深拷贝直填，替代逐元素逐属性的关键字物化。
+static INITIAL_COMPUTED: OnceLock<HashMap<&'static str, ComputedValue>> = OnceLock::new();
+
+/// 取属性的预生成 initial [`ComputedValue`]（Arc 克隆，引用计数 +1）。
+fn initial_computed(def: &PropertyDefinition) -> ComputedValue {
+    INITIAL_COMPUTED
+        .get_or_init(|| {
+            BUILTIN_PROPERTIES
+                .iter()
+                .map(|p| (p.name, ComputedValue::from_keyword(p.initial_value)))
+                .collect::<HashMap<_, _>>()
+        })
+        .get(def.name)
+        .cloned()
+        .unwrap_or_else(|| ComputedValue::from_keyword(def.initial_value))
 }
 
 /// 将 font-size 的关键字形态值归一化为 px Dimension。

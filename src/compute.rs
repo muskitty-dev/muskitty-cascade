@@ -703,6 +703,41 @@ fn resolve_percentage(
     }
 }
 
+/// CAS-3：值是否无需 compute 解析（[`compute_value_with`] 恒等）。
+///
+/// [`resolve_component`] 只可能改写三类 token：可换算单位的 Dimension
+/// （[`converts_to_px`]）、需在此阶段解析的百分比（font-size 等，
+/// [`resolve_percentage`]）、函数（var()/calc()/嵌套参数递归）。三类都
+/// 不出现时输出 == 输入，调用方可直接共享声明值 Arc 跳过逐 token 物化
+/// （[`crate::style_tree`] 的 CAS-2/3 快速路径）。
+pub(crate) fn needs_no_resolution(tokens: &[ComponentValue], property: &str) -> bool {
+    // font-size（ParentFontSize）与 rem 基准属性（RootFontSize）的百分比
+    // 在此阶段换算为 px；其余基准推迟到 layout，原样保留。
+    let pct_resolves = matches!(
+        lookup_property(property).map(|d| d.percentages),
+        Some(PercentageBasis::ParentFontSize) | Some(PercentageBasis::RootFontSize)
+    );
+    tokens.iter().all(|cv| match cv {
+        // var() 替换 / calc() 折叠 / 参数递归 → 需完整解析。
+        ComponentValue::Function(_) => false,
+        ComponentValue::PreservedToken(Token::Dimension(_, unit)) => !converts_to_px(unit),
+        ComponentValue::PreservedToken(Token::Percentage(_)) => !pct_resolves,
+        _ => true,
+    })
+}
+
+/// [`resolve_dimension`] 会换算为 px 的单位（em/rem/vh/vw/vmin/vmax 与
+/// 绝对单位 pt/pc/in/cm/mm/q）。
+///
+/// **同步义务**：`resolve_dimension` 的换算分支增删单位时必须同步本表
+/// （两者相邻，见 `resolve_dimension` 的 PERF-5 注释）。
+fn converts_to_px(unit: &str) -> bool {
+    const CONVERTED: &[&str] = &[
+        "em", "rem", "vh", "vw", "vmin", "vmax", "pt", "pc", "in", "cm", "mm", "q",
+    ];
+    CONVERTED.iter().any(|u| unit.eq_ignore_ascii_case(u))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

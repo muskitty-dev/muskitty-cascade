@@ -76,7 +76,9 @@ pub fn collect_custom_properties(
                 // P2-4：CSS-wide 关键字（initial/inherit/unset/revert）不写入，
                 // 避免 var() 替换出字面量关键字。
                 if !is_css_wide_keyword(&winner.value) {
-                    props.insert(property.clone(), winner.value.clone());
+                    // CAS-2：DeclaredValue.value 已 Arc 化；本表仍为 Vec
+                    //（每元素一次浅转，自定义属性通常少量）。
+                    props.insert(property.clone(), winner.value.to_vec());
                 }
             }
         }

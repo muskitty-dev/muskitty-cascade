@@ -102,7 +102,8 @@ mod tests {
             property: property.to_string(),
             value: vec![ComponentValue::PreservedToken(Token::Ident(
                 "red".to_string(),
-            ))],
+            ))]
+            .into(),
             important,
             origin,
             specificity,

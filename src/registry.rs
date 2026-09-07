@@ -2,6 +2,9 @@
 //!
 //! 初始覆盖 ~20 个常用属性。后续可扩展为完整属性数据库。
 
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
 /// 属性百分比参考值类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PercentageBasis {
@@ -509,11 +512,38 @@ pub static BUILTIN_PROPERTIES: &[PropertyDefinition] = &[
     },
 ];
 
+/// CAS-3：属性名 → 定义的哈希索引（O(1) 查找）。
+///
+/// 原实现对 [`BUILTIN_PROPERTIES`] 的线性 `eq_ignore_ascii_case` 扫描被
+/// 每声明、每默认值、每百分比 token 调用（元素 × 属性量级）。内建表的
+/// name 均为 ASCII 小写 `&'static str`：先按原串直查（CSS 属性名惯用
+/// 小写，零分配），未命中且含大写时才 `to_ascii_lowercase` 复查一次。
+///
+/// **不变式**：新增属性定义的 `name` 必须全小写，否则大写查询路径失配。
+static PROPERTY_INDEX: OnceLock<HashMap<&'static str, &'static PropertyDefinition>> =
+    OnceLock::new();
+
+fn property_index() -> &'static HashMap<&'static str, &'static PropertyDefinition> {
+    PROPERTY_INDEX.get_or_init(|| {
+        BUILTIN_PROPERTIES
+            .iter()
+            .map(|p| (p.name, p))
+            .collect::<HashMap<_, _>>()
+    })
+}
+
 /// 查找属性定义。返回 `None` 表示属性未注册。
+///
+/// CAS-3：经 [`PROPERTY_INDEX`] 哈希查找（O(1)），替代原全表线性扫描。
 pub fn lookup_property(name: &str) -> Option<&'static PropertyDefinition> {
-    BUILTIN_PROPERTIES
-        .iter()
-        .find(|p| p.name.eq_ignore_ascii_case(name))
+    let idx = property_index();
+    idx.get(name).copied().or_else(|| {
+        if name.bytes().any(|b| b.is_ascii_uppercase()) {
+            idx.get(&*name.to_ascii_lowercase()).copied()
+        } else {
+            None
+        }
+    })
 }
 
 #[cfg(test)]

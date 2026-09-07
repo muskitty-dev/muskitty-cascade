@@ -187,17 +187,26 @@ struct VarResolver<'a> {
     in_progress: HashSet<String>,
     /// 当前 var() 引用嵌套深度（F-2）。
     depth: usize,
+    /// 本次属性计算已物化的输出 token 总数（V-1 输出预算）。
+    emitted: usize,
 }
 
 /// var() 解析最大引用嵌套深度（审计 F-2）。真实样式表的 var() 链极少
 /// 超过个位数；32 已远超合理使用，仅拦截敌意输入。
 const MAX_VAR_DEPTH: usize = 32;
 
-/// var() 替换单次求值的输出 token 预算（审计 V-1，2026-09-06）。F-2 只封
-/// 递归深度，不封输出规模：`--v{i}: var(--v{i-1}) var(--v{i-1})` 在深度
-/// 合法的前提下输出 2^N token（N=28 ≈ 2.7 亿）→ 记忆化缓存全量物化 →
-/// OOM abort。10 万 token/属性已远超任何真实样式表的 var() 展开规模；
-/// 超限按 guaranteed-invalid 处理（css-variables-1 §3.1）。
+/// var() 展开的输出 token 预算（审计 V-1，每次属性计算共享）。
+///
+/// F-2 的深度上限只封**递归深度**，不封**输出规模**：`--v0:red;
+/// --v{i}: var(--v{i-1}) var(--v{i-1})`（i≤25，深度 ≤32 完全合法）+
+/// `*{color:var(--v25)}` 时记忆化缓存的整条展开被逐级 `.cloned()`
+/// 物化，每属性 2^25 ≈ 3300 万 token（1.5-3 GB）；i=28 达 10+ GB →
+/// OOM abort。此预算在 `resolve_tokens` 的 `extend` 前**预检**累加：
+/// 超限返回 `Err`（与 F-2 同语义：外层 var() 走 fallback，无
+/// fallback 则整属性 invalid at computed-value time），放大链在首次
+/// 超限处即截断，物化前不再分配超限缓冲。10 万/属性对齐 Chromium
+/// var 替换的 substitution 长度预算量级，真实样式表的 var 展开
+/// 远达不到。
 const MAX_VAR_OUTPUT_TOKENS: usize = 100_000;
 
 impl<'a> VarResolver<'a> {
@@ -207,6 +216,7 @@ impl<'a> VarResolver<'a> {
             resolved: HashMap::new(),
             in_progress: HashSet::new(),
             depth: 0,
+            emitted: 0,
         }
     }
 
@@ -215,11 +225,6 @@ impl<'a> VarResolver<'a> {
     ///
     /// 输入 token 的生命周期独立于 `'a`：调用方可能是属性 specified 值
     /// （短借用），也可能是 `ctx` 内自定义属性值（长借用）。
-    ///
-    /// 审计 V-1（2026-09-06）：输出超 [`MAX_VAR_OUTPUT_TOKENS`] 时返回
-    /// `Err`——该值按 guaranteed-invalid 处理（与 F-2 深度超限同语义，
-    /// css-variables-1 §3.1）。记忆化缓存条目本身经由此处构建，预算同时
-    /// 阻止巨型展开进入缓存（否则 `.cloned()` 复用会在后续引用上复现）。
     fn resolve_tokens(
         &mut self,
         tokens: &[ComponentValue],
@@ -227,10 +232,14 @@ impl<'a> VarResolver<'a> {
     ) -> Result<Vec<ComponentValue>, ()> {
         let mut out = Vec::with_capacity(tokens.len());
         for cv in tokens {
-            out.extend(self.resolve_component(cv, property)?);
-            if out.len() > MAX_VAR_OUTPUT_TOKENS {
+            let resolved = self.resolve_component(cv, property)?;
+            // V-1：输出预算预检（extend 之前），见 [`MAX_VAR_OUTPUT_TOKENS`]。
+            let next = self.emitted + resolved.len();
+            if next > MAX_VAR_OUTPUT_TOKENS {
                 return Err(());
             }
+            self.emitted = next;
+            out.extend(resolved);
         }
         Ok(out)
     }
@@ -694,6 +703,41 @@ fn resolve_percentage(
     }
 }
 
+/// CAS-3：值是否无需 compute 解析（[`compute_value_with`] 恒等）。
+///
+/// [`resolve_component`] 只可能改写三类 token：可换算单位的 Dimension
+/// （[`converts_to_px`]）、需在此阶段解析的百分比（font-size 等，
+/// [`resolve_percentage`]）、函数（var()/calc()/嵌套参数递归）。三类都
+/// 不出现时输出 == 输入，调用方可直接共享声明值 Arc 跳过逐 token 物化
+/// （[`crate::style_tree`] 的 CAS-2/3 快速路径）。
+pub(crate) fn needs_no_resolution(tokens: &[ComponentValue], property: &str) -> bool {
+    // font-size（ParentFontSize）与 rem 基准属性（RootFontSize）的百分比
+    // 在此阶段换算为 px；其余基准推迟到 layout，原样保留。
+    let pct_resolves = matches!(
+        lookup_property(property).map(|d| d.percentages),
+        Some(PercentageBasis::ParentFontSize) | Some(PercentageBasis::RootFontSize)
+    );
+    tokens.iter().all(|cv| match cv {
+        // var() 替换 / calc() 折叠 / 参数递归 → 需完整解析。
+        ComponentValue::Function(_) => false,
+        ComponentValue::PreservedToken(Token::Dimension(_, unit)) => !converts_to_px(unit),
+        ComponentValue::PreservedToken(Token::Percentage(_)) => !pct_resolves,
+        _ => true,
+    })
+}
+
+/// [`resolve_dimension`] 会换算为 px 的单位（em/rem/vh/vw/vmin/vmax 与
+/// 绝对单位 pt/pc/in/cm/mm/q）。
+///
+/// **同步义务**：`resolve_dimension` 的换算分支增删单位时必须同步本表
+/// （两者相邻，见 `resolve_dimension` 的 PERF-5 注释）。
+fn converts_to_px(unit: &str) -> bool {
+    const CONVERTED: &[&str] = &[
+        "em", "rem", "vh", "vw", "vmin", "vmax", "pt", "pc", "in", "cm", "mm", "q",
+    ];
+    CONVERTED.iter().any(|u| unit.eq_ignore_ascii_case(u))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1074,56 +1118,6 @@ mod tests {
         }
     }
 
-    // —— V-1（审计 2026-09-06）：var() 记忆化输出的指数放大无预算 ——
-
-    /// 指数链：--v0: red；--v{i}: var(--v{i-1}) var(--v{i-1})。深度 i ≤ 32
-    /// 完全合法（F-2 深度守卫不拦），但输出 2^N token。
-    fn exponential_var_chain(props: &mut HashMap<String, Vec<ComponentValue>>, n: usize) {
-        props.insert(
-            "--v0".to_string(),
-            vec![ComponentValue::PreservedToken(Token::Ident(
-                "red".to_string(),
-            ))],
-        );
-        for i in 1..=n {
-            props.insert(
-                format!("--v{i}"),
-                vec![
-                    var_fn(&format!("--v{}", i - 1)),
-                    var_fn(&format!("--v{}", i - 1)),
-                ],
-            );
-        }
-    }
-
-    #[test]
-    fn var_exponential_chain_within_output_budget_resolves() {
-        // i=16 → 2^16 = 65536 token：远超真实样式表的合法使用，仍在
-        // 输出预算内 → 完整展开。
-        let mut props = HashMap::new();
-        exponential_var_chain(&mut props, 16);
-        let ctx = ctx_with_custom(&props);
-        let result = compute_value("color", &[var_fn("--v16")], &ctx);
-        assert_eq!(
-            result.tokens().len(),
-            1 << 16,
-            "within-budget expansion intact"
-        );
-    }
-
-    #[test]
-    fn var_exponential_chain_over_output_budget_is_invalid() {
-        // i=28 → 2^28 ≈ 2.7 亿 token。修复前：记忆化缓存逐级全量物化 →
-        // 数 GB → OOM abort（~1 KB CSS 即可触发）。修复后：resolve_tokens
-        // 超输出预算按 guaranteed-invalid 处理（与 F-2 深度超限同语义），
-        // 且巨型展开不会进入缓存。
-        let mut props = HashMap::new();
-        exponential_var_chain(&mut props, 28);
-        let ctx = ctx_with_custom(&props);
-        let result = compute_value_with("color", &[var_fn("--v28")], &ctx);
-        assert!(result.is_err(), "over-budget expansion must be invalid");
-    }
-
     #[test]
     fn var_deep_chain_with_fallback_resolves_to_fallback() {
         // 超限链带 fallback → fallback 生效（guaranteed-invalid 走 P1-2 路径）。
@@ -1186,9 +1180,9 @@ mod tests {
         // --v0: red; --v{i}: var(--v{i-1}) var(--v{i-1})
         // 输出规模 2^N 是语义使然；记忆化保证每级只展开一次，时间线性于输出。
         // 修复前（N=22）需 30.9s 且按 N×2^N 指数重复递归。
-        // V-1（审计 2026-09-06）后输出受 MAX_VAR_OUTPUT_TOKENS 预算约束，
-        // N=18（2^18=262144）已超 10 万预算 → 改用 N=16 保持线性时间证明。
-        const N: usize = 16;
+        // V-1 后预算为全局计数（缓存构建 + 物化各计一次）：--vN 构建累计
+        // ≈ 2^(N+1)，N=15（输出 32,768，累计 65,534）仍在预算内完整展开。
+        const N: usize = 15;
         let mut props = HashMap::new();
         props.insert(
             "--v0".to_string(),
@@ -1214,6 +1208,84 @@ mod tests {
             })
             .count();
         assert_eq!(reds, 1 << N, "all tokens must be `red`");
+    }
+
+    // —— V-1: var() 展开输出 token 预算（记忆化输出的指数放大 OOM）——
+
+    /// 构造 `--v0: red; --v{i}: var(--v{i-1}) var(--v{i-1})` 的倍增链。
+    fn doubling_var_chain(n: usize) -> HashMap<String, Vec<ComponentValue>> {
+        let mut props = HashMap::new();
+        props.insert(
+            "--v0".to_string(),
+            vec![ComponentValue::PreservedToken(Token::Ident(
+                "red".to_string(),
+            ))],
+        );
+        for i in 1..=n {
+            let prev = format!("--v{}", i - 1);
+            props.insert(format!("--v{}", i), vec![var_fn(&prev), var_fn(&prev)]);
+        }
+        props
+    }
+
+    #[test]
+    fn var_doubling_chain_exceeding_output_budget_is_invalid_not_oom() {
+        // V-1：N=25（深度 ≤32 完全合法，输出 2^25 ≈ 3300 万 token）
+        // 修复前物化整条展开 → 1.5-3 GB（N=28 时 10+ GB）→ OOM abort；
+        // 修复后预算预检在首次超限处截断 → 无 fallback → invalid → 空，
+        // 耗时与内存均有界。
+        let props = doubling_var_chain(25);
+        let ctx = ctx_with_custom(&props);
+        let result = compute_value("color", &[var_fn("--v25")], &ctx);
+        assert!(
+            result.tokens().is_empty(),
+            "expansion exceeding MAX_VAR_OUTPUT_TOKENS must be invalid, not materialized"
+        );
+    }
+
+    #[test]
+    fn var_output_budget_boundary_within_limit_still_resolves() {
+        // N=15：输出 32,768，全局累计（构建 65,534 + 物化 32,768 =
+        // 98,302）≤ 100,000 → 预算内完整展开（边界不误伤合法链）。
+        let props = doubling_var_chain(15);
+        let ctx = ctx_with_custom(&props);
+        let result = compute_value("color", &[var_fn("--v15")], &ctx);
+        assert_eq!(
+            result.tokens().len(),
+            1 << 15,
+            "32,768-token expansion is within budget and must fully resolve"
+        );
+    }
+
+    #[test]
+    fn var_output_budget_exceeded_with_fallback_uses_fallback() {
+        // 与 F-2 深度超限同语义：超限 → guaranteed-invalid → fallback 生效。
+        let props = doubling_var_chain(25);
+        let ctx = ctx_with_custom(&props);
+        let result = compute_value("color", &[var_fn_fb("--v25", "blue")], &ctx);
+        let cvs = result.tokens();
+        assert_eq!(cvs.len(), 1);
+        match &cvs[0] {
+            ComponentValue::PreservedToken(Token::Ident(s)) => assert_eq!(s, "blue"),
+            other => panic!("expected fallback `blue`, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn var_output_budget_is_per_property_computation() {
+        // 预算随每次 compute_value 新建 VarResolver 重置：同 ctx 上
+        // 前一个属性超限失效，不影响后续小属性的解析。
+        let props = doubling_var_chain(25);
+        let ctx = ctx_with_custom(&props);
+        let over = compute_value("color", &[var_fn("--v25")], &ctx);
+        assert!(over.tokens().is_empty());
+        let small = compute_value("color", &[var_fn("--v0")], &ctx);
+        let cvs = small.tokens();
+        assert_eq!(cvs.len(), 1);
+        match &cvs[0] {
+            ComponentValue::PreservedToken(Token::Ident(s)) => assert_eq!(s, "red"),
+            other => panic!("expected `red`, got {:?}", other),
+        }
     }
 
     #[test]

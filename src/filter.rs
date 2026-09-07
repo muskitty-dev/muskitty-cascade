@@ -52,7 +52,8 @@ struct PreparedRule {
 /// 一条声明的数据（元素无关）。
 struct PreparedDecl {
     name: String,
-    value: Vec<ComponentValue>,
+    /// CAS-2：Arc 共享——命中该声明的元素递增引用计数，不再深拷贝。
+    value: std::sync::Arc<[ComponentValue]>,
     important: bool,
 }
 
@@ -198,7 +199,9 @@ fn prepare_rules(
                         .iter()
                         .map(|d| PreparedDecl {
                             name: d.name.clone(),
-                            value: d.value.clone(),
+                            // CAS-2：prepare 期一次 Vec→Arc（原每元素
+                            // to_vec 深拷贝在此消除）。
+                            value: d.value.clone().into(),
                             important: d.important,
                         })
                         .collect();
@@ -304,7 +307,8 @@ pub fn collect_declared_values_prepared(
                     &mut result,
                     order,
                     &decl.name,
-                    &decl.value,
+                    // CAS-2：Arc 克隆（引用计数 +1，零深拷贝）。
+                    std::sync::Arc::clone(&decl.value),
                     decl.important,
                     rule.origin,
                     rule.specificity,
@@ -348,7 +352,9 @@ fn collect_from_style_attr(
                     result,
                     *order,
                     &decl.name,
-                    &decl.value,
+                    // inline style 每元素重新解析，Vec→Arc 一次拷贝
+                    // （与原 to_vec 等价；规则路径的 Arc 共享不适用于此）。
+                    decl.value.clone(),
                     decl.important,
                     Origin::Author,
                     specificity,
@@ -387,24 +393,28 @@ fn normalize_property_name(name: &str) -> Option<String> {
 ///   [`normalize_property_name`] 过滤前展开。展开为空 = 简写值无效 → 丢弃。
 /// - P2-2/P2-21：其余属性名归一化 + 未知属性过滤（[`normalize_property_name`]）。
 ///
+/// `value` 按值传入：规则路径传 `Arc`（CAS-2 零拷贝），inline style 路径
+/// 传 `Vec`（每次解析新生成，转入 Arc 等价于原 `to_vec` 一次拷贝）。
+///
 /// `order` 由调用方递增后传入。
 #[allow(clippy::too_many_arguments)]
 fn push_declared(
     result: &mut Vec<DeclaredValue>,
     order: usize,
     name: &str,
-    value: &[ComponentValue],
+    value: impl Into<std::sync::Arc<[ComponentValue]>>,
     important: bool,
     origin: Origin,
     specificity: Specificity,
     layer_order: Option<usize>,
     from_style_attr: bool,
 ) {
-    if let Some(expanded) = expand_shorthand(name, value) {
+    let value = value.into();
+    if let Some(expanded) = expand_shorthand(name, &value) {
         for (p, v) in expanded {
             result.push(DeclaredValue {
                 property: p.to_string(),
-                value: v,
+                value: v.into(),
                 important,
                 origin,
                 specificity,
@@ -422,7 +432,8 @@ fn push_declared(
     };
     result.push(DeclaredValue {
         property,
-        value: value.to_vec(),
+        // CAS-2：Arc 递增引用计数（原 value.to_vec() 每元素深拷贝）。
+        value,
         important,
         origin,
         specificity,

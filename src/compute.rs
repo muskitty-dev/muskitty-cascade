@@ -193,6 +193,13 @@ struct VarResolver<'a> {
 /// 超过个位数；32 已远超合理使用，仅拦截敌意输入。
 const MAX_VAR_DEPTH: usize = 32;
 
+/// var() 替换单次求值的输出 token 预算（审计 V-1，2026-09-06）。F-2 只封
+/// 递归深度，不封输出规模：`--v{i}: var(--v{i-1}) var(--v{i-1})` 在深度
+/// 合法的前提下输出 2^N token（N=28 ≈ 2.7 亿）→ 记忆化缓存全量物化 →
+/// OOM abort。10 万 token/属性已远超任何真实样式表的 var() 展开规模；
+/// 超限按 guaranteed-invalid 处理（css-variables-1 §3.1）。
+const MAX_VAR_OUTPUT_TOKENS: usize = 100_000;
+
 impl<'a> VarResolver<'a> {
     fn new(ctx: &'a ComputeContext<'a>) -> Self {
         Self {
@@ -208,6 +215,11 @@ impl<'a> VarResolver<'a> {
     ///
     /// 输入 token 的生命周期独立于 `'a`：调用方可能是属性 specified 值
     /// （短借用），也可能是 `ctx` 内自定义属性值（长借用）。
+    ///
+    /// 审计 V-1（2026-09-06）：输出超 [`MAX_VAR_OUTPUT_TOKENS`] 时返回
+    /// `Err`——该值按 guaranteed-invalid 处理（与 F-2 深度超限同语义，
+    /// css-variables-1 §3.1）。记忆化缓存条目本身经由此处构建，预算同时
+    /// 阻止巨型展开进入缓存（否则 `.cloned()` 复用会在后续引用上复现）。
     fn resolve_tokens(
         &mut self,
         tokens: &[ComponentValue],
@@ -216,6 +228,9 @@ impl<'a> VarResolver<'a> {
         let mut out = Vec::with_capacity(tokens.len());
         for cv in tokens {
             out.extend(self.resolve_component(cv, property)?);
+            if out.len() > MAX_VAR_OUTPUT_TOKENS {
+                return Err(());
+            }
         }
         Ok(out)
     }
@@ -1059,6 +1074,56 @@ mod tests {
         }
     }
 
+    // —— V-1（审计 2026-09-06）：var() 记忆化输出的指数放大无预算 ——
+
+    /// 指数链：--v0: red；--v{i}: var(--v{i-1}) var(--v{i-1})。深度 i ≤ 32
+    /// 完全合法（F-2 深度守卫不拦），但输出 2^N token。
+    fn exponential_var_chain(props: &mut HashMap<String, Vec<ComponentValue>>, n: usize) {
+        props.insert(
+            "--v0".to_string(),
+            vec![ComponentValue::PreservedToken(Token::Ident(
+                "red".to_string(),
+            ))],
+        );
+        for i in 1..=n {
+            props.insert(
+                format!("--v{i}"),
+                vec![
+                    var_fn(&format!("--v{}", i - 1)),
+                    var_fn(&format!("--v{}", i - 1)),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn var_exponential_chain_within_output_budget_resolves() {
+        // i=16 → 2^16 = 65536 token：远超真实样式表的合法使用，仍在
+        // 输出预算内 → 完整展开。
+        let mut props = HashMap::new();
+        exponential_var_chain(&mut props, 16);
+        let ctx = ctx_with_custom(&props);
+        let result = compute_value("color", &[var_fn("--v16")], &ctx);
+        assert_eq!(
+            result.tokens().len(),
+            1 << 16,
+            "within-budget expansion intact"
+        );
+    }
+
+    #[test]
+    fn var_exponential_chain_over_output_budget_is_invalid() {
+        // i=28 → 2^28 ≈ 2.7 亿 token。修复前：记忆化缓存逐级全量物化 →
+        // 数 GB → OOM abort（~1 KB CSS 即可触发）。修复后：resolve_tokens
+        // 超输出预算按 guaranteed-invalid 处理（与 F-2 深度超限同语义），
+        // 且巨型展开不会进入缓存。
+        let mut props = HashMap::new();
+        exponential_var_chain(&mut props, 28);
+        let ctx = ctx_with_custom(&props);
+        let result = compute_value_with("color", &[var_fn("--v28")], &ctx);
+        assert!(result.is_err(), "over-budget expansion must be invalid");
+    }
+
     #[test]
     fn var_deep_chain_with_fallback_resolves_to_fallback() {
         // 超限链带 fallback → fallback 生效（guaranteed-invalid 走 P1-2 路径）。
@@ -1121,7 +1186,9 @@ mod tests {
         // --v0: red; --v{i}: var(--v{i-1}) var(--v{i-1})
         // 输出规模 2^N 是语义使然；记忆化保证每级只展开一次，时间线性于输出。
         // 修复前（N=22）需 30.9s 且按 N×2^N 指数重复递归。
-        const N: usize = 18;
+        // V-1（审计 2026-09-06）后输出受 MAX_VAR_OUTPUT_TOKENS 预算约束，
+        // N=18（2^18=262144）已超 10 万预算 → 改用 N=16 保持线性时间证明。
+        const N: usize = 16;
         let mut props = HashMap::new();
         props.insert(
             "--v0".to_string(),

@@ -261,7 +261,44 @@ fn compute_element_style<'a>(
         normalize_line_width(&mut cs, name);
     }
 
+    // line-height 百分比归一化（CSS Inline L3 §4.2）：百分比按**自身**
+    // font-size 在计算值阶段解析为长度（Chrome `getComputedStyle` 亦返回 px）。
+    // `<number>` 保持数字形态——它是倍数且随值继承，必须由各元素自身
+    // font-size 折算（见 cascade `text_props::used_line_height_px`）。
+    normalize_line_height_percentage(&mut cs, own_font_size);
+
     (cs, own_font_size)
+}
+
+/// 把 `line-height: <percentage>` 归一化为 px Dimension。
+///
+/// 计算值语义：百分比相对**自身** font-size（`own_font_size`）解析；数/长度/
+/// `normal` 原样保留。负百分比与非法值不在此处理（使用值阶段回退 `normal`）。
+fn normalize_line_height_percentage(cs: &mut ComputedStyle, own_font_size: f64) {
+    let Some(cv) = cs.get("line-height") else {
+        return;
+    };
+    let pct = cv.tokens().iter().find_map(|v| match v {
+        ComponentValue::PreservedToken(Token::Percentage(numeric))
+            if numeric.value.is_finite() && numeric.value >= 0.0 =>
+        {
+            Some(numeric.value)
+        }
+        _ => None,
+    });
+    let Some(pct) = pct else {
+        return;
+    };
+    cs.set(
+        "line-height",
+        ComputedValue::from_tokens(vec![ComponentValue::PreservedToken(Token::Dimension(
+            Numeric {
+                value: pct / 100.0 * own_font_size,
+                is_integer: false,
+            },
+            "px".to_string(),
+        ))]),
+    );
 }
 
 /// 需要关键字→px 归一化的宽度属性（四向 border-width + outline-width）。

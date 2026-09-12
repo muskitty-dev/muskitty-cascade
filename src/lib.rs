@@ -52,6 +52,7 @@ pub mod origin;
 pub mod registry;
 pub mod style;
 pub mod style_tree;
+pub mod text_props;
 
 pub use cascade::{cascade_for_element, cascade_winner};
 pub use compute::{compute_value, compute_value_with, ComputeContext, CustomPropertySource};
@@ -65,3 +66,6 @@ pub use origin::Origin;
 pub use registry::{lookup_property, PropertyDefinition, BUILTIN_PROPERTIES};
 pub use style::{ComputedStyle, ComputedValue, DeclaredValue};
 pub use style_tree::{compute_styles, StyleTreeOptions};
+pub use text_props::{
+    apply_text_transform, text_transform_keyword, used_line_height_px, NORMAL_LINE_HEIGHT,
+};

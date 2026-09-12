@@ -379,3 +379,67 @@ fn border_width_default_medium_normalizes_without_declaration() {
     let cs = styles.get(&addr(&a)).unwrap();
     assert_eq!(style_px(cs, "border-top-width"), 7.0);
 }
+
+// —— M-3 batch 3: line-height 计算值（CSS Inline L3 §4.2）——
+
+#[test]
+fn line_height_percentage_normalizes_against_own_font_size() {
+    // 150% × 24px = 36px（百分比按自身 font-size 在计算值阶段解析）
+    let dom = parse_dom(
+        r#"<html><body><div id="a" style="font-size: 24px; line-height: 150%"></div></body></html>"#,
+    );
+    let styles = run_from_dom(&dom, "");
+    let a = element_with_id(&dom, "a");
+    let cs = styles.get(&addr(&a)).unwrap();
+    assert_eq!(style_px(cs, "line-height"), 36.0);
+}
+
+#[test]
+fn line_height_number_and_normal_stay_unresolved() {
+    // 数保持数字形态（倍数随值继承，由各元素自身 font-size 折算）；
+    // normal 保持关键字（使用值阶段取 UA 默认 1.2）
+    let dom = parse_dom(
+        r#"<html><body><div id="a" style="font-size: 20px; line-height: 1.5"></div><div id="b" style="line-height: normal"></div></body></html>"#,
+    );
+    let styles = run_from_dom(&dom, "");
+    let a = element_with_id(&dom, "a");
+    let cs = styles.get(&addr(&a)).unwrap();
+    let number = cs.get("line-height").unwrap();
+    assert!(
+        matches!(
+            number.tokens().first(),
+            Some(ComponentValue::PreservedToken(Token::Number(_)))
+        ),
+        "line-height: 1.5 must stay a number (it inherits as a multiplier), got {:?}",
+        number.tokens()
+    );
+    assert_eq!(
+        muskitty_cascade::used_line_height_px(cs, 20.0),
+        30.0,
+        "1.5 × 20px"
+    );
+
+    let b = element_with_id(&dom, "b");
+    let cs_b = styles.get(&addr(&b)).unwrap();
+    assert_eq!(style_ident(cs_b, "line-height"), "normal");
+    assert_eq!(muskitty_cascade::used_line_height_px(cs_b, 16.0), 19.2);
+}
+
+#[test]
+fn line_height_number_inherits_as_multiplier() {
+    // 父 1.5 / 16px → 父行高 24px；子 font-size 32px 继承同一个 1.5 → 48px
+    let dom = parse_dom(
+        r#"<html><body><div id="a" style="font-size: 16px; line-height: 1.5"><span id="b" style="font-size: 32px"></span></div></body></html>"#,
+    );
+    let styles = run_from_dom(&dom, "");
+    let a = element_with_id(&dom, "a");
+    let b = element_with_id(&dom, "b");
+    let cs_a = styles.get(&addr(&a)).unwrap();
+    let cs_b = styles.get(&addr(&b)).unwrap();
+    assert_eq!(muskitty_cascade::used_line_height_px(cs_a, 16.0), 24.0);
+    assert_eq!(
+        muskitty_cascade::used_line_height_px(cs_b, 32.0),
+        48.0,
+        "inherited multiplier applies to the child's own font-size"
+    );
+}

@@ -389,6 +389,30 @@ pub static BUILTIN_PROPERTIES: &[PropertyDefinition] = &[
         percentages: PercentageBasis::None,
     },
     PropertyDefinition {
+        name: "border-top-style",
+        initial_value: "none",
+        inherited: false,
+        percentages: PercentageBasis::None,
+    },
+    PropertyDefinition {
+        name: "border-right-style",
+        initial_value: "none",
+        inherited: false,
+        percentages: PercentageBasis::None,
+    },
+    PropertyDefinition {
+        name: "border-bottom-style",
+        initial_value: "none",
+        inherited: false,
+        percentages: PercentageBasis::None,
+    },
+    PropertyDefinition {
+        name: "border-left-style",
+        initial_value: "none",
+        inherited: false,
+        percentages: PercentageBasis::None,
+    },
+    PropertyDefinition {
         name: "border-top-color",
         initial_value: "currentcolor",
         inherited: false,
@@ -412,25 +436,9 @@ pub static BUILTIN_PROPERTIES: &[PropertyDefinition] = &[
         inherited: false,
         percentages: PercentageBasis::None,
     },
-    // —— 边框组简写（renderer extract_border 直接读取，P2-21 需注册）——
-    PropertyDefinition {
-        name: "border-width",
-        initial_value: "medium",
-        inherited: false,
-        percentages: PercentageBasis::None,
-    },
-    PropertyDefinition {
-        name: "border-style",
-        initial_value: "none",
-        inherited: false,
-        percentages: PercentageBasis::None,
-    },
-    PropertyDefinition {
-        name: "border-color",
-        initial_value: "currentcolor",
-        inherited: false,
-        percentages: PercentageBasis::None,
-    },
+    // `border` / `border-<side>` / `border-width|style|color` 均为**简写**，
+    // 在 filter.rs `expand_shorthand` 阶段展开为上面 12 条方向性长属性，
+    // 不需要（也不应）注册——注册表只存长属性，与 margin/padding 一致。
     PropertyDefinition {
         name: "outline-width",
         initial_value: "medium",

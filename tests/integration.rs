@@ -760,15 +760,62 @@ fn font_shorthand_does_not_emit_font() {
 }
 
 // —— border 简写（CSS Backgrounds & Borders L3 §4.4）——
+//
+// M-3 batch 2：`border`/`border-<side>`/`border-width|style|color` 全部展开为
+// **方向性长属性**（12 条 / 3 条 / 4 条）。统一的 border-width/style/color
+// 是简写而非长属性，展开后不应存在。
+
+/// 四边后缀，与 `expand_box_4` 的 top/right/bottom/left 顺序一致。
+const SIDES: [&str; 4] = ["top", "right", "bottom", "left"];
+
+/// 断言某条简写把四边三个长属性都设成了同样的值。
+fn assert_all_sides(
+    element: &DomElement,
+    sheet: &muskitty_cssom::CssStyleSheet,
+    width: Option<(f64, &str)>,
+    style: Option<&str>,
+    color: Option<&str>,
+) {
+    for side in SIDES {
+        if let Some((v, unit)) = width {
+            assert_tok_dim(
+                &winner_tokens(element, sheet, &format!("border-{side}-width")),
+                v,
+                unit,
+            );
+        }
+        if let Some(s) = style {
+            assert_tok_ident(
+                &winner_tokens(element, sheet, &format!("border-{side}-style")),
+                s,
+            );
+        }
+        if let Some(c) = color {
+            assert_tok_ident(
+                &winner_tokens(element, sheet, &format!("border-{side}-color")),
+                c,
+            );
+        }
+    }
+}
 
 #[test]
-fn border_shorthand_full_expands() {
-    // border: <width> <style> <color> → 三个通用 longhand
+fn border_shorthand_full_expands_all_sides() {
+    // border: <width> <style> <color> → 12 条方向性长属性（每边 3 条）
     let element = make_element("div", &[]);
     let sheet = make_sheet("div { border: 1px solid red; }", Origin::Author);
-    assert_tok_dim(&winner_tokens(&element, &sheet, "border-width"), 1.0, "px");
-    assert_tok_ident(&winner_tokens(&element, &sheet, "border-style"), "solid");
-    assert_tok_ident(&winner_tokens(&element, &sheet, "border-color"), "red");
+    assert_all_sides(
+        &element,
+        &sheet,
+        Some((1.0, "px")),
+        Some("solid"),
+        Some("red"),
+    );
+
+    // 统一属性名不再产出（简写不注册为长属性）
+    assert!(winner_tokens(&element, &sheet, "border-width").is_empty());
+    assert!(winner_tokens(&element, &sheet, "border-style").is_empty());
+    assert!(winner_tokens(&element, &sheet, "border-color").is_empty());
 }
 
 #[test]
@@ -776,22 +823,28 @@ fn border_shorthand_order_independent() {
     // || 组合：顺序无关
     let element = make_element("div", &[]);
     let sheet = make_sheet("div { border: red 1px solid; }", Origin::Author);
-    assert_tok_dim(&winner_tokens(&element, &sheet, "border-width"), 1.0, "px");
-    assert_tok_ident(&winner_tokens(&element, &sheet, "border-style"), "solid");
-    assert_tok_ident(&winner_tokens(&element, &sheet, "border-color"), "red");
+    assert_all_sides(
+        &element,
+        &sheet,
+        Some((1.0, "px")),
+        Some("solid"),
+        Some("red"),
+    );
 }
 
 #[test]
 fn border_shorthand_partial_defaults() {
-    // 仅 style → width/color 补注册表初始值
+    // 仅 style → width/color 补注册表初始值（关键字宽度在此阶段仍是 Ident，
+    // px 归一化发生在 style_tree 的 computed value 阶段）
     let element = make_element("div", &[]);
     let sheet = make_sheet("div { border: solid; }", Origin::Author);
-    assert_tok_ident(&winner_tokens(&element, &sheet, "border-width"), "medium");
-    assert_tok_ident(&winner_tokens(&element, &sheet, "border-style"), "solid");
-    assert_tok_ident(
-        &winner_tokens(&element, &sheet, "border-color"),
-        "currentcolor",
-    );
+    assert_all_sides(&element, &sheet, None, Some("solid"), Some("currentcolor"));
+    for side in SIDES {
+        assert_tok_ident(
+            &winner_tokens(&element, &sheet, &format!("border-{side}-width")),
+            "medium",
+        );
+    }
 }
 
 #[test]
@@ -799,9 +852,7 @@ fn border_shorthand_no_width_style_defaults() {
     // 仅 color → width/style 补初始值
     let element = make_element("div", &[]);
     let sheet = make_sheet("div { border: red; }", Origin::Author);
-    assert_tok_ident(&winner_tokens(&element, &sheet, "border-width"), "medium");
-    assert_tok_ident(&winner_tokens(&element, &sheet, "border-style"), "none");
-    assert_tok_ident(&winner_tokens(&element, &sheet, "border-color"), "red");
+    assert_all_sides(&element, &sheet, None, Some("none"), Some("red"));
 }
 
 #[test]
@@ -809,16 +860,15 @@ fn border_shorthand_zero_width() {
     // number 0 是合法 <line-width>
     let element = make_element("div", &[]);
     let sheet = make_sheet("div { border: 0 solid red; }", Origin::Author);
-    assert_tok_number(&winner_tokens(&element, &sheet, "border-width"), 0.0);
-    assert_tok_ident(&winner_tokens(&element, &sheet, "border-style"), "solid");
-    assert_tok_ident(&winner_tokens(&element, &sheet, "border-color"), "red");
+    assert_tok_number(&winner_tokens(&element, &sheet, "border-top-width"), 0.0);
+    assert_all_sides(&element, &sheet, None, Some("solid"), Some("red"));
 }
 
 #[test]
 fn border_shorthand_hash_color() {
     let element = make_element("div", &[]);
     let sheet = make_sheet("div { border: 1px solid #ff0000; }", Origin::Author);
-    let toks = winner_tokens(&element, &sheet, "border-color");
+    let toks = winner_tokens(&element, &sheet, "border-top-color");
     assert_eq!(toks.len(), 1, "expected single token, got {:?}", toks);
     assert!(
         matches!(
@@ -832,12 +882,12 @@ fn border_shorthand_hash_color() {
 
 #[test]
 fn border_shorthand_duplicate_category_invalid() {
-    // 两个 width → 无效简写 → 不产出任何 longhand
+    // 两个 width → 无效简写 → 不产出任何方向性 longhand
     let element = make_element("div", &[]);
     let sheet = make_sheet("div { border: 1px 2px; }", Origin::Author);
-    assert!(winner_tokens(&element, &sheet, "border-width").is_empty());
-    assert!(winner_tokens(&element, &sheet, "border-style").is_empty());
-    assert!(winner_tokens(&element, &sheet, "border-color").is_empty());
+    assert!(winner_tokens(&element, &sheet, "border-top-width").is_empty());
+    assert!(winner_tokens(&element, &sheet, "border-top-style").is_empty());
+    assert!(winner_tokens(&element, &sheet, "border-top-color").is_empty());
 }
 
 #[test]
@@ -845,19 +895,24 @@ fn border_shorthand_invalid_component_dropped() {
     // number 2 不是合法 width（非 0）→ 无法分类 → 无效
     let element = make_element("div", &[]);
     let sheet = make_sheet("div { border: 2; }", Origin::Author);
-    assert!(winner_tokens(&element, &sheet, "border-width").is_empty());
-    assert!(winner_tokens(&element, &sheet, "border-style").is_empty());
-    assert!(winner_tokens(&element, &sheet, "border-color").is_empty());
+    assert!(winner_tokens(&element, &sheet, "border-top-width").is_empty());
+    assert!(winner_tokens(&element, &sheet, "border-top-style").is_empty());
+    assert!(winner_tokens(&element, &sheet, "border-top-color").is_empty());
 }
 
 #[test]
 fn border_shorthand_global_keyword_expands() {
-    // 单全局关键字 → 三个 longhand 均取该关键字
+    // 单全局关键字 → 12 条 longhand 均取该关键字
     let element = make_element("div", &[]);
     let sheet = make_sheet("div { border: inherit; }", Origin::Author);
-    assert_tok_ident(&winner_tokens(&element, &sheet, "border-width"), "inherit");
-    assert_tok_ident(&winner_tokens(&element, &sheet, "border-style"), "inherit");
-    assert_tok_ident(&winner_tokens(&element, &sheet, "border-color"), "inherit");
+    assert_all_sides(&element, &sheet, None, Some("inherit"), Some("inherit"));
+    // 宽度也是 inherit（assert_all_sides 的 width 断言走 dim 检查，单独断言 ident）
+    for side in SIDES {
+        assert_tok_ident(
+            &winner_tokens(&element, &sheet, &format!("border-{side}-width")),
+            "inherit",
+        );
+    }
 }
 
 #[test]
@@ -868,7 +923,251 @@ fn border_shorthand_does_not_emit_border() {
     let declared = collect_declared_values(&element, &[sheet]);
     let props: Vec<&str> = declared.iter().map(|d| d.property.as_str()).collect();
     assert!(!props.contains(&"border"), "border should be expanded away");
-    assert!(props.contains(&"border-width"));
-    assert!(props.contains(&"border-style"));
-    assert!(props.contains(&"border-color"));
+    assert!(props.contains(&"border-top-width"));
+    assert!(props.contains(&"border-bottom-style"));
+    assert!(props.contains(&"border-left-color"));
+}
+
+// —— border-<side> 方向性简写（§4.4）——
+
+#[test]
+fn border_side_shorthand_expands_that_side_only() {
+    let element = make_element("div", &[]);
+    let sheet = make_sheet("div { border-top: 4px dashed blue; }", Origin::Author);
+    assert_tok_dim(
+        &winner_tokens(&element, &sheet, "border-top-width"),
+        4.0,
+        "px",
+    );
+    assert_tok_ident(
+        &winner_tokens(&element, &sheet, "border-top-style"),
+        "dashed",
+    );
+    assert_tok_ident(&winner_tokens(&element, &sheet, "border-top-color"), "blue");
+    for side in ["right", "bottom", "left"] {
+        assert!(
+            winner_tokens(&element, &sheet, &format!("border-{side}-width")).is_empty(),
+            "border-{side}-width must stay unset"
+        );
+    }
+}
+
+#[test]
+fn border_side_shorthand_defaults_and_global_keyword() {
+    let element = make_element("div", &[]);
+    // 仅颜色：width/style 取初始值
+    let sheet = make_sheet("div { border-left: red; }", Origin::Author);
+    assert_tok_ident(
+        &winner_tokens(&element, &sheet, "border-left-width"),
+        "medium",
+    );
+    assert_tok_ident(
+        &winner_tokens(&element, &sheet, "border-left-style"),
+        "none",
+    );
+    assert_tok_ident(&winner_tokens(&element, &sheet, "border-left-color"), "red");
+
+    // 全局关键字
+    let sheet = make_sheet("div { border-bottom: unset; }", Origin::Author);
+    assert_tok_ident(
+        &winner_tokens(&element, &sheet, "border-bottom-width"),
+        "unset",
+    );
+    assert_tok_ident(
+        &winner_tokens(&element, &sheet, "border-bottom-style"),
+        "unset",
+    );
+    assert_tok_ident(
+        &winner_tokens(&element, &sheet, "border-bottom-color"),
+        "unset",
+    );
+}
+
+#[test]
+fn border_side_shorthand_invalid_dropped() {
+    // 两个 width 分量 → 无效
+    let element = make_element("div", &[]);
+    let sheet = make_sheet("div { border-right: 1px 2px; }", Origin::Author);
+    assert!(winner_tokens(&element, &sheet, "border-right-width").is_empty());
+    assert!(winner_tokens(&element, &sheet, "border-right-style").is_empty());
+}
+
+// —— border-width/style/color 多值简写（§4.2/§4.3）——
+
+#[test]
+fn border_width_four_values_per_side() {
+    // 1/2/3/4 值 → 顺时针 top/right/bottom/left
+    let element = make_element("div", &[]);
+    let sheet = make_sheet("div { border-width: 1px 2px 3px 4px; }", Origin::Author);
+    assert_tok_dim(
+        &winner_tokens(&element, &sheet, "border-top-width"),
+        1.0,
+        "px",
+    );
+    assert_tok_dim(
+        &winner_tokens(&element, &sheet, "border-right-width"),
+        2.0,
+        "px",
+    );
+    assert_tok_dim(
+        &winner_tokens(&element, &sheet, "border-bottom-width"),
+        3.0,
+        "px",
+    );
+    assert_tok_dim(
+        &winner_tokens(&element, &sheet, "border-left-width"),
+        4.0,
+        "px",
+    );
+}
+
+#[test]
+fn border_width_two_and_three_values() {
+    let element = make_element("div", &[]);
+    // 3 值：上=1 左右=2 下=3
+    let sheet = make_sheet("div { border-width: 1px 2px 3px; }", Origin::Author);
+    assert_tok_dim(
+        &winner_tokens(&element, &sheet, "border-top-width"),
+        1.0,
+        "px",
+    );
+    assert_tok_dim(
+        &winner_tokens(&element, &sheet, "border-right-width"),
+        2.0,
+        "px",
+    );
+    assert_tok_dim(
+        &winner_tokens(&element, &sheet, "border-bottom-width"),
+        3.0,
+        "px",
+    );
+    assert_tok_dim(
+        &winner_tokens(&element, &sheet, "border-left-width"),
+        2.0,
+        "px",
+    );
+
+    // 2 值：上下=1 左右=2
+    let sheet = make_sheet("div { border-width: 1px 2px; }", Origin::Author);
+    assert_tok_dim(
+        &winner_tokens(&element, &sheet, "border-top-width"),
+        1.0,
+        "px",
+    );
+    assert_tok_dim(
+        &winner_tokens(&element, &sheet, "border-right-width"),
+        2.0,
+        "px",
+    );
+    assert_tok_dim(
+        &winner_tokens(&element, &sheet, "border-bottom-width"),
+        1.0,
+        "px",
+    );
+    assert_tok_dim(
+        &winner_tokens(&element, &sheet, "border-left-width"),
+        2.0,
+        "px",
+    );
+}
+
+#[test]
+fn border_style_and_color_multi_values() {
+    let element = make_element("div", &[]);
+    let sheet = make_sheet(
+        "div { border-style: solid none; border-color: red blue green; }",
+        Origin::Author,
+    );
+    assert_tok_ident(
+        &winner_tokens(&element, &sheet, "border-top-style"),
+        "solid",
+    );
+    assert_tok_ident(
+        &winner_tokens(&element, &sheet, "border-right-style"),
+        "none",
+    );
+    assert_tok_ident(
+        &winner_tokens(&element, &sheet, "border-bottom-style"),
+        "solid",
+    );
+    assert_tok_ident(
+        &winner_tokens(&element, &sheet, "border-left-style"),
+        "none",
+    );
+
+    assert_tok_ident(&winner_tokens(&element, &sheet, "border-top-color"), "red");
+    assert_tok_ident(
+        &winner_tokens(&element, &sheet, "border-right-color"),
+        "blue",
+    );
+    assert_tok_ident(
+        &winner_tokens(&element, &sheet, "border-bottom-color"),
+        "green",
+    );
+    assert_tok_ident(
+        &winner_tokens(&element, &sheet, "border-left-color"),
+        "blue",
+    );
+}
+
+#[test]
+fn border_box_shorthand_invalid_values_dropped() {
+    let element = make_element("div", &[]);
+    // 5 值 → 无效
+    let sheet = make_sheet("div { border-width: 1px 2px 3px 4px 5px; }", Origin::Author);
+    assert!(winner_tokens(&element, &sheet, "border-top-width").is_empty());
+    // width 位置给了 style 关键字 → 无效
+    let sheet = make_sheet("div { border-width: 1px solid; }", Origin::Author);
+    assert!(winner_tokens(&element, &sheet, "border-top-width").is_empty());
+    // style 位置给了颜色 → 无效
+    let sheet = make_sheet("div { border-style: solid red; }", Origin::Author);
+    assert!(winner_tokens(&element, &sheet, "border-top-style").is_empty());
+    // 空值 → 无效
+    let sheet = make_sheet("div { border-color: ; }", Origin::Author);
+    assert!(winner_tokens(&element, &sheet, "border-top-color").is_empty());
+}
+
+#[test]
+fn border_box_shorthand_global_keyword() {
+    let element = make_element("div", &[]);
+    let sheet = make_sheet("div { border-width: inherit; }", Origin::Author);
+    for side in SIDES {
+        assert_tok_ident(
+            &winner_tokens(&element, &sheet, &format!("border-{side}-width")),
+            "inherit",
+        );
+    }
+}
+
+// —— outline 简写（CSS UI L4 §4）——
+
+#[test]
+fn outline_shorthand_expands() {
+    let element = make_element("div", &[]);
+    let sheet = make_sheet("div { outline: 2px solid red; }", Origin::Author);
+    assert_tok_dim(&winner_tokens(&element, &sheet, "outline-width"), 2.0, "px");
+    assert_tok_ident(&winner_tokens(&element, &sheet, "outline-style"), "solid");
+    assert_tok_ident(&winner_tokens(&element, &sheet, "outline-color"), "red");
+}
+
+#[test]
+fn outline_shorthand_defaults_use_auto_color() {
+    // outline-color 初始值是 auto（不是 currentcolor）
+    let element = make_element("div", &[]);
+    let sheet = make_sheet("div { outline: solid; }", Origin::Author);
+    assert_tok_ident(&winner_tokens(&element, &sheet, "outline-width"), "medium");
+    assert_tok_ident(&winner_tokens(&element, &sheet, "outline-style"), "solid");
+    assert_tok_ident(&winner_tokens(&element, &sheet, "outline-color"), "auto");
+}
+
+#[test]
+fn outline_shorthand_global_keyword_and_invalid() {
+    let element = make_element("div", &[]);
+    let sheet = make_sheet("div { outline: initial; }", Origin::Author);
+    assert_tok_ident(&winner_tokens(&element, &sheet, "outline-width"), "initial");
+    assert_tok_ident(&winner_tokens(&element, &sheet, "outline-style"), "initial");
+    assert_tok_ident(&winner_tokens(&element, &sheet, "outline-color"), "initial");
+
+    let sheet = make_sheet("div { outline: 1px 2px; }", Origin::Author);
+    assert!(winner_tokens(&element, &sheet, "outline-width").is_empty());
 }

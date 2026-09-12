@@ -337,3 +337,45 @@ fn plain_declared_value_computes_identically() {
     // 绝对单位 px 值原样保留。
     assert_eq!(style_px(cs, "margin-left"), 10.0);
 }
+
+// —— M-3 batch 2: border/outline 宽度关键字归一化（CSS Backgrounds L3 §4.3）——
+
+#[test]
+fn border_width_keywords_normalize_to_px() {
+    let dom = parse_dom(
+        r#"<html><body><div id="a" style="border: thin solid red; border-left-width: thick; outline: medium solid"></div></body></html>"#,
+    );
+    let styles = run_from_dom(&dom, "");
+    let a = element_with_id(&dom, "a");
+    let cs = styles.get(&addr(&a)).unwrap();
+    // thin=1px / medium=3px / thick=5px（Chrome/Firefox 取值）
+    assert_eq!(style_px(cs, "border-top-width"), 1.0);
+    assert_eq!(style_px(cs, "border-right-width"), 1.0);
+    assert_eq!(
+        style_px(cs, "border-left-width"),
+        5.0,
+        "later declaration wins"
+    );
+    assert_eq!(style_px(cs, "outline-width"), 3.0);
+}
+
+#[test]
+fn border_width_default_medium_normalizes_without_declaration() {
+    // 未声明任何 border → 初始值 medium 同样归一化为 3px（used 值由
+    // style=none 在下游定为 0）
+    let dom = parse_dom(r#"<html><body><div id="a"></div></body></html>"#);
+    let styles = run_from_dom(&dom, "");
+    let a = element_with_id(&dom, "a");
+    let cs = styles.get(&addr(&a)).unwrap();
+    assert_eq!(style_px(cs, "border-top-width"), 3.0);
+    assert_eq!(style_px(cs, "outline-width"), 3.0);
+
+    // 显式 px 宽度原样保留
+    let dom = parse_dom(
+        r#"<html><body><div id="a" style="border-width: 7px; border-style: solid"></div></body></html>"#,
+    );
+    let styles = run_from_dom(&dom, "");
+    let a = element_with_id(&dom, "a");
+    let cs = styles.get(&addr(&a)).unwrap();
+    assert_eq!(style_px(cs, "border-top-width"), 7.0);
+}

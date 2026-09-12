@@ -255,8 +255,23 @@ fn compute_element_style<'a>(
         cs.set(prop_def.name.to_string(), computed);
     }
 
+    // 边框/轮廓宽度关键字归一化（见 [`normalize_line_width`]）：`medium`
+    // 等关键字在此转成 px，layout 与 renderer 共用同一份映射。
+    for name in LINE_WIDTH_PROPERTIES {
+        normalize_line_width(&mut cs, name);
+    }
+
     (cs, own_font_size)
 }
+
+/// 需要关键字→px 归一化的宽度属性（四向 border-width + outline-width）。
+const LINE_WIDTH_PROPERTIES: [&str; 5] = [
+    "border-top-width",
+    "border-right-width",
+    "border-bottom-width",
+    "border-left-width",
+    "outline-width",
+];
 
 /// 对单个属性执行 defaulting + compute。
 ///
@@ -355,6 +370,36 @@ fn normalize_font_size(cv: ComputedValue, px: f64) -> ComputedValue {
     } else {
         cv
     }
+}
+
+/// 将 `border-<side>-width` / `outline-width` 的 `<line-width>` 关键字
+/// 归一化为 px Dimension（`thin`/`medium`/`thick` → 1/3/5）。
+///
+/// CSS Backgrounds & Borders L3 §4.3：三个关键字宽度 UA 相关，取值与
+/// Chrome/Firefox 对齐（1/3/5px）。computed value 的语义是长度，故与
+/// font-size 同样在此归一化——layout（taffy border）与 renderer（绘制）
+/// 共用单一映射，避免两处各写一份。显式长度（px Dimension / `0` Number）
+/// 与无法识别的值原样保留（下游按 0 处理）。
+///
+/// 注意：style 为 `none`/`hidden` 时 **used** width = 0（§4.1），该判定
+/// 属布局/绘制阶段（`style` 与 `width` 是两个属性），不在此处做。
+fn normalize_line_width(cs: &mut ComputedStyle, name: &str) {
+    let px = match cs.get(name).and_then(|cv| cv.keyword()) {
+        Some(kw) if kw.eq_ignore_ascii_case("thin") => 1.0,
+        Some(kw) if kw.eq_ignore_ascii_case("medium") => 3.0,
+        Some(kw) if kw.eq_ignore_ascii_case("thick") => 5.0,
+        _ => return,
+    };
+    cs.set(
+        name,
+        ComputedValue::from_tokens(vec![ComponentValue::PreservedToken(Token::Dimension(
+            Numeric {
+                value: px,
+                is_integer: false,
+            },
+            "px".to_string(),
+        ))]),
+    );
 }
 
 /// 从 ComputedStyle 的 font-size 值提取 px 数值。

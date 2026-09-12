@@ -483,6 +483,16 @@ fn expand_shorthand(
         Some(expand_gap(value))
     } else if name.eq_ignore_ascii_case("border") {
         Some(expand_border(value))
+    } else if let Some(side) = border_side_index(name) {
+        Some(expand_border_side(value, side))
+    } else if name.eq_ignore_ascii_case("border-width") {
+        Some(expand_border_box(value, BORDER_BOX_WIDTH, is_border_width))
+    } else if name.eq_ignore_ascii_case("border-style") {
+        Some(expand_border_box(value, BORDER_BOX_STYLE, is_border_style))
+    } else if name.eq_ignore_ascii_case("border-color") {
+        Some(expand_border_box(value, BORDER_BOX_COLOR, is_border_color))
+    } else if name.eq_ignore_ascii_case("outline") {
+        Some(expand_outline(value))
     } else {
         None
     }
@@ -497,6 +507,38 @@ const BOX_PADDING: [&str; 4] = [
     "padding-bottom",
     "padding-left",
 ];
+
+/// `border-<side>-width` 四向长属性名（顺序 top/right/bottom/left，同 [`expand_box_4`]）。
+const BORDER_BOX_WIDTH: [&str; 4] = [
+    "border-top-width",
+    "border-right-width",
+    "border-bottom-width",
+    "border-left-width",
+];
+/// `border-<side>-style` 四向长属性名。
+const BORDER_BOX_STYLE: [&str; 4] = [
+    "border-top-style",
+    "border-right-style",
+    "border-bottom-style",
+    "border-left-style",
+];
+/// `border-<side>-color` 四向长属性名。
+const BORDER_BOX_COLOR: [&str; 4] = [
+    "border-top-color",
+    "border-right-color",
+    "border-bottom-color",
+    "border-left-color",
+];
+
+/// 方向性简写名（`border-top` 等）→ 边序号（0=top, 1=right, 2=bottom, 3=left）。
+///
+/// 返回 `None` 表示非方向性简写。`border` 本身不含 `-` 后缀，不会误命中。
+fn border_side_index(name: &str) -> Option<usize> {
+    let rest = name.strip_prefix("border-")?;
+    ["top", "right", "bottom", "left"]
+        .iter()
+        .position(|s| rest.eq_ignore_ascii_case(s))
+}
 
 /// `margin`/`padding` 简写（CSS Box Model L3 §3.1 / §4.2）。
 ///
@@ -736,57 +778,180 @@ fn is_border_color(cv: &ComponentValue) -> bool {
     }
 }
 
-/// `border` 简写（CSS Backgrounds & Borders L3 §4.4）。
+/// 解析 `border`/`border-<side>`/`outline` 的 `<line-width> || <line-style> || <color>`
+/// 三分量（CSS Backgrounds & Borders L3 §4.4 / CSS UI L4 §4）。
 ///
-/// `border: <line-width> || <line-style> || <color>`：顺序无关、每类至多一次，
-/// 重复或无法分类 → 无效（返回空，声明丢弃）。缺失类别取注册表初始值
-/// （medium / none / currentcolor，见 registry.rs）。显式补全三个 longhand——
-/// renderer `extract_border` 逐条读取，漏发 border-width 会因默认 "medium"
-/// ident 无法解析成 px 而无边框。单全局关键字 → 三个长属性均取该关键字。
-fn expand_border(value: &[ComponentValue]) -> Vec<(&'static str, Vec<ComponentValue>)> {
-    if let Some(kw) = single_global_keyword(value) {
-        return ["border-width", "border-style", "border-color"]
-            .iter()
-            .map(|p| (*p, vec![ident_token(&kw)]))
-            .collect();
-    }
+/// 顺序无关、每类至多一次；重复或无法分类 → `None`（整条声明无效）。
+/// 缺失类别由调用方按注册表初始值补齐（width=medium / style=none /
+/// color=currentcolor；outline-color 的初始值是 `auto`）。
+fn parse_border_triple(
+    value: &[ComponentValue],
+) -> Option<(
+    Option<ComponentValue>,
+    Option<ComponentValue>,
+    Option<ComponentValue>,
+)> {
     let mut width: Option<ComponentValue> = None;
     let mut style: Option<ComponentValue> = None;
     let mut color: Option<ComponentValue> = None;
     for cv in non_ws_parts(value) {
         if is_border_width(cv) {
             if width.is_some() {
-                return vec![];
+                return None;
             }
             width = Some((*cv).clone());
         } else if is_border_style(cv) {
             if style.is_some() {
-                return vec![];
+                return None;
             }
             style = Some((*cv).clone());
         } else if is_border_color(cv) {
             if color.is_some() {
-                return vec![];
+                return None;
             }
             color = Some((*cv).clone());
         } else {
-            return vec![]; // 无法分类 → 无效
+            return None; // 无法分类 → 无效
         }
     }
-    vec![
-        (
-            "border-width",
-            vec![width.unwrap_or_else(|| ident_token("medium"))],
-        ),
-        (
-            "border-style",
-            vec![style.unwrap_or_else(|| ident_token("none"))],
-        ),
-        (
-            "border-color",
-            vec![color.unwrap_or_else(|| ident_token("currentcolor"))],
-        ),
-    ]
+    Some((width, style, color))
+}
+
+/// 由三分量生成三条（或 12 条）长属性声明。
+///
+/// `width_props`/`style_props`/`color_props` 同长度（1 = 统一属性组如
+/// `outline`，4 = 四向）。缺失分量取注册表初始值（`default_style`/
+/// `default_color` 由调用方给出——outline-color 初始值为 `auto`）。
+fn border_longhands(
+    width: Option<ComponentValue>,
+    style: Option<ComponentValue>,
+    color: Option<ComponentValue>,
+    width_props: &[&'static str],
+    style_props: &[&'static str],
+    color_props: &[&'static str],
+    default_color: &str,
+) -> Vec<(&'static str, Vec<ComponentValue>)> {
+    let width_cv = width.unwrap_or_else(|| ident_token("medium"));
+    let style_cv = style.unwrap_or_else(|| ident_token("none"));
+    let color_cv = color.unwrap_or_else(|| ident_token(default_color));
+    width_props
+        .iter()
+        .zip(style_props)
+        .zip(color_props)
+        .flat_map(|((w, s), c)| {
+            [
+                (*w, vec![width_cv.clone()]),
+                (*s, vec![style_cv.clone()]),
+                (*c, vec![color_cv.clone()]),
+            ]
+        })
+        .collect()
+}
+
+/// `border` 简写（CSS Backgrounds & Borders L3 §4.4）→ **12 条**方向性长属性。
+///
+/// `border` 是四向简写的简写：展开必须落到 per-side 长属性，否则
+/// `border: 2px solid` 之后的 `border-top-width: 5px` 排序语义无法正确
+/// （统一长属性与方向性长属性是两套属性名，cascade 无法跨名比较）。
+/// 单全局关键字 → 12 条长属性均取该关键字（CSS Cascade L5 §3.2）。
+fn expand_border(value: &[ComponentValue]) -> Vec<(&'static str, Vec<ComponentValue>)> {
+    if let Some(kw) = single_global_keyword(value) {
+        return BORDER_BOX_WIDTH
+            .iter()
+            .chain(BORDER_BOX_STYLE.iter())
+            .chain(BORDER_BOX_COLOR.iter())
+            .map(|p| (*p, vec![ident_token(&kw)]))
+            .collect();
+    }
+    let Some((width, style, color)) = parse_border_triple(value) else {
+        return vec![];
+    };
+    border_longhands(
+        width,
+        style,
+        color,
+        &BORDER_BOX_WIDTH,
+        &BORDER_BOX_STYLE,
+        &BORDER_BOX_COLOR,
+        "currentcolor",
+    )
+}
+
+/// `border-<side>` 方向性简写（CSS Backgrounds & Borders L3 §4.4）→ 该边 3 条长属性。
+fn expand_border_side(
+    value: &[ComponentValue],
+    side: usize,
+) -> Vec<(&'static str, Vec<ComponentValue>)> {
+    let props = [
+        BORDER_BOX_WIDTH[side],
+        BORDER_BOX_STYLE[side],
+        BORDER_BOX_COLOR[side],
+    ];
+    if let Some(kw) = single_global_keyword(value) {
+        return props.iter().map(|p| (*p, vec![ident_token(&kw)])).collect();
+    }
+    let Some((width, style, color)) = parse_border_triple(value) else {
+        return vec![];
+    };
+    border_longhands(
+        width,
+        style,
+        color,
+        &props[0..1],
+        &props[1..2],
+        &props[2..3],
+        "currentcolor",
+    )
+}
+
+/// `border-width`/`border-style`/`border-color` 简写（CSS Backgrounds &
+/// Borders L3 §4.3/§4.2）→ 四向长属性。
+///
+/// 1–4 值按 [`expand_box_4`] 分配（上/右/下/左）；每个分量须为对应类别
+/// （`valid` 判定），任一非法 → 整条声明无效（返回空）。0 或 >4 分量同样
+/// 无效。单全局关键字 → 四向均取该关键字。
+fn expand_border_box(
+    value: &[ComponentValue],
+    props: [&'static str; 4],
+    valid: fn(&ComponentValue) -> bool,
+) -> Vec<(&'static str, Vec<ComponentValue>)> {
+    if single_global_keyword(value).is_some() {
+        return expand_box_4(value, props);
+    }
+    let parts = non_ws_parts(value);
+    if parts.is_empty() || parts.len() > 4 {
+        return vec![];
+    }
+    if !parts.iter().all(|cv| valid(cv)) {
+        return vec![];
+    }
+    expand_box_4(value, props)
+}
+
+/// `outline` 简写（CSS UI Level 4 §4）→ `outline-width`/`outline-style`/`outline-color`。
+///
+/// 语法同 `border`（`<line-width> || <line-style> || <color>`），但
+/// `outline-color` 初始值是 `auto`（不是 currentcolor）。outline 不参与
+/// 布局（绘制在 border box 之外）。
+fn expand_outline(value: &[ComponentValue]) -> Vec<(&'static str, Vec<ComponentValue>)> {
+    if let Some(kw) = single_global_keyword(value) {
+        return ["outline-width", "outline-style", "outline-color"]
+            .iter()
+            .map(|p| (*p, vec![ident_token(&kw)]))
+            .collect();
+    }
+    let Some((width, style, color)) = parse_border_triple(value) else {
+        return vec![];
+    };
+    border_longhands(
+        width,
+        style,
+        color,
+        &["outline-width"],
+        &["outline-style"],
+        &["outline-color"],
+        "auto",
+    )
 }
 
 /// 取非空白分量（借用）。

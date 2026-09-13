@@ -295,6 +295,7 @@ fn normalize_line_height_percentage(cs: &mut ComputedStyle, own_font_size: f64) 
             Numeric {
                 value: pct / 100.0 * own_font_size,
                 is_integer: false,
+                has_sign: false,
             },
             "px".to_string(),
         ))]),
@@ -401,6 +402,7 @@ fn normalize_font_size(cv: ComputedValue, px: f64) -> ComputedValue {
             Numeric {
                 value: px,
                 is_integer: false,
+                has_sign: false,
             },
             "px".to_string(),
         ))])
@@ -433,6 +435,7 @@ fn normalize_line_width(cs: &mut ComputedStyle, name: &str) {
             Numeric {
                 value: px,
                 is_integer: false,
+                has_sign: false,
             },
             "px".to_string(),
         ))]),

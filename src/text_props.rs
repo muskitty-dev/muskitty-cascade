@@ -141,6 +141,7 @@ mod tests {
             Numeric {
                 value: v,
                 is_integer: false,
+                has_sign: false,
             },
             "px".to_string(),
         ))
@@ -150,6 +151,7 @@ mod tests {
         ComponentValue::PreservedToken(Token::Number(Numeric {
             value: v,
             is_integer: false,
+            has_sign: false,
         }))
     }
 
@@ -157,6 +159,7 @@ mod tests {
         ComponentValue::PreservedToken(Token::Percentage(Numeric {
             value: v,
             is_integer: false,
+            has_sign: false,
         }))
     }
 

@@ -1102,18 +1102,12 @@ fn ident_token(s: &str) -> ComponentValue {
 
 /// 构造 Number token。
 fn number_token(v: f64) -> ComponentValue {
-    ComponentValue::PreservedToken(Token::Number(Numeric {
-        value: v,
-        is_integer: v.fract() == 0.0,
-    }))
+    ComponentValue::PreservedToken(Token::Number(Numeric::new(v, v.fract() == 0.0)))
 }
 
 /// 构造 Percentage token。
 fn percentage_token(v: f64) -> ComponentValue {
-    ComponentValue::PreservedToken(Token::Percentage(Numeric {
-        value: v,
-        is_integer: v.fract() == 0.0,
-    }))
+    ComponentValue::PreservedToken(Token::Percentage(Numeric::new(v, v.fract() == 0.0)))
 }
 
 // ── P2-6: @media / @supports 条件评估 ─────────────────────────────

@@ -461,3 +461,110 @@ fn media_comma_list_is_or() {
     let declared = collect_declared_values(&element, &[sheet]);
     assert_eq!(declared.len(), 1);
 }
+
+// ---- CS-1：sheet 级字段（disabled / alternate / media 属性）----
+
+/// 把 `media` 属性式的 media query 列表（ident 序列）挂到表上。
+fn with_media_attr(
+    mut sheet: muskitty_cssom::CssStyleSheet,
+    idents: &[&str],
+) -> muskitty_cssom::CssStyleSheet {
+    use muskitty_css::tokenizer::Token;
+    use muskitty_cssom::ComponentValue;
+    sheet.media = idents
+        .iter()
+        .map(|i| ComponentValue::PreservedToken(Token::Ident((*i).to_string())))
+        .collect();
+    sheet
+}
+
+/// 声明的值里是否含某个 ident（用于断言胜者来源）。
+fn has_ident(value: &[muskitty_cssom::ComponentValue], want: &str) -> bool {
+    use muskitty_css::tokenizer::Token;
+    use muskitty_cssom::ComponentValue;
+    value
+        .iter()
+        .any(|cv| matches!(cv, ComponentValue::PreservedToken(Token::Ident(n)) if n == want))
+}
+
+#[test]
+fn disabled_sheet_is_skipped() {
+    // <link disabled>（HTML §4.2.4 L754-760）→ 整表不生效。
+    let element = make_element("div", &[]);
+    let mut sheet = make_sheet("div { color: red; }", Origin::Author);
+    sheet.disabled = true;
+    assert!(collect_declared_values(&element, &[sheet]).is_empty());
+}
+
+#[test]
+fn alternate_sheet_is_skipped() {
+    // <link rel="alternate stylesheet">：未被显式启用 → 不生效（本轮无切换 UI）。
+    let element = make_element("div", &[]);
+    let mut sheet = make_sheet("div { color: red; }", Origin::Author);
+    sheet.alternate = true;
+    assert!(collect_declared_values(&element, &[sheet]).is_empty());
+}
+
+#[test]
+fn sheet_media_attribute_gates_whole_sheet() {
+    // HTML §4.2.4 L841：外链的 media 属性是规定性的——不匹配整表不应用。
+    let element = make_element("div", &[]);
+    let print_sheet = with_media_attr(
+        make_sheet("div { color: red; }", Origin::Author),
+        &["print"],
+    );
+    let screen_sheet = with_media_attr(
+        make_sheet("div { color: blue; }", Origin::Author),
+        &["screen"],
+    );
+
+    assert!(
+        collect_declared_values(&element, &[print_sheet]).is_empty(),
+        "media=print 在 screen 环境不生效"
+    );
+    assert_eq!(
+        collect_declared_values(&element, &[screen_sheet]).len(),
+        1,
+        "media=screen 生效"
+    );
+}
+
+#[test]
+fn sheet_media_attribute_comma_list_is_or() {
+    use muskitty_css::tokenizer::Token;
+    use muskitty_cssom::ComponentValue;
+    let element = make_element("div", &[]);
+    let mut sheet = make_sheet("div { color: red; }", Origin::Author);
+    sheet.media = vec![
+        ComponentValue::PreservedToken(Token::Ident("print".to_string())),
+        ComponentValue::PreservedToken(Token::Comma),
+        ComponentValue::PreservedToken(Token::Ident("screen".to_string())),
+    ];
+    assert_eq!(collect_declared_values(&element, &[sheet]).len(), 1);
+}
+
+#[test]
+fn empty_sheet_media_applies() {
+    // 空 media 列表 = 无媒体条件（内嵌 <style> 与无 media 属性的 link）。
+    let element = make_element("div", &[]);
+    let sheet = make_sheet("div { color: red; }", Origin::Author);
+    assert!(sheet.media.is_empty());
+    assert_eq!(collect_declared_values(&element, &[sheet]).len(), 1);
+}
+
+#[test]
+fn disabled_first_sheet_lets_later_one_win() {
+    // 被禁用的表不参与层叠，也不占 order：后一张表仍按文档序胜出。
+    let element = make_element("div", &[]);
+    let mut first = make_sheet("div { color: red; }", Origin::Author);
+    first.disabled = true;
+    let second = make_sheet("div { color: green; }", Origin::Author);
+
+    let declared = collect_declared_values(&element, &[first, second]);
+    assert_eq!(declared.len(), 1);
+    assert_eq!(declared[0].origin, Origin::Author);
+    assert!(
+        has_ident(&declared[0].value, "green"),
+        "胜者应来自未被禁用的第二张表"
+    );
+}

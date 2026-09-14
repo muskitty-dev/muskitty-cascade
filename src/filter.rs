@@ -103,6 +103,10 @@ pub fn prepare_sheets(sheets: &[CssStyleSheet]) -> PreparedSheets {
 ///
 /// 同 [`prepare_sheets`]，但按给定 [`MediaContext`] 评估 `@media` 条件，
 /// 剪枝不命中的规则组。
+///
+/// CS-1：sheet 级字段先于展平生效——`disabled` / `alternate`（替代样式表
+/// 未被显式启用）整表跳过；`media` 非空时按当前 [`MediaContext`] 求值，
+/// 不命中整表跳过（HTML §4.2.4 L841：外链的 `media` 属性是规定性的）。
 pub fn prepare_sheets_with_context(
     sheets: &[CssStyleSheet],
     media: &MediaContext,
@@ -110,6 +114,9 @@ pub fn prepare_sheets_with_context(
     let mut rules = Vec::new();
     let mut layers = LayerTracker::new();
     for sheet in sheets {
+        if !sheet_applies(sheet, media) {
+            continue;
+        }
         prepare_rules(
             &sheet.css_rules,
             sheet.origin,
@@ -119,6 +126,20 @@ pub fn prepare_sheets_with_context(
         );
     }
     PreparedSheets { rules }
+}
+
+/// sheet 级门控：这张表是否参与层叠（CS-1）。
+///
+/// - `disabled`（CSSOM §8.1 disabled flag；`<link disabled>`）：不生效；
+/// - `alternate`（§8.1 alternate flag；`<link rel="alternate stylesheet">`）：
+///   未被显式启用 → 不生效（本实现无样式表切换 UI，一律按未启用处理）；
+/// - `media`（§8.1 media，来自元素的 `media` 属性）：非空时为 media query
+///   列表，按 `MediaContext` 求值；不命中整表跳过。空列表 = 无媒体条件。
+fn sheet_applies(sheet: &CssStyleSheet, media: &MediaContext) -> bool {
+    if sheet.disabled || sheet.alternate {
+        return false;
+    }
+    sheet.media.is_empty() || eval_media_query(media, &sheet.media)
 }
 
 /// @layer 全局序号分配器（P1-3）。

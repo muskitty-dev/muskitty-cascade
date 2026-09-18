@@ -12,7 +12,7 @@
 
 use muskitty_cascade::{
     apply_defaulting, cascade_for_element, cascade_winner, collect_declared_values, compute_value,
-    ComputeContext, ComputedValue,
+    lookup_property, ComputeContext, ComputedValue,
 };
 use muskitty_css::parse_stylesheet;
 use muskitty_css::tokenizer::Token;
@@ -707,6 +707,100 @@ fn background_shorthand_does_not_emit_background() {
         "background should be expanded away"
     );
     assert!(props.contains(&"background-color"));
+}
+
+// —— BG-1: background-image 注册 + background 简写 image 分量 ——
+
+#[test]
+fn background_image_is_registered_with_initial_none() {
+    let def = lookup_property("background-image").expect("background-image must be registered");
+    assert!(!def.inherited, "background-image is not inherited");
+    assert_eq!(def.initial_value, "none");
+}
+
+#[test]
+fn background_image_url_longhand_survives_filtering() {
+    // 未注册时该声明在 filter 阶段即被丢弃；注册后完整进入 cascade。
+    // 无引号形式：tokenizer 直接产出 Token::Url。
+    let element = make_element("div", &[]);
+    let sheet = make_sheet("div { background-image: url(bg.png); }", Origin::Author);
+    let toks = winner_tokens(&element, &sheet, "background-image");
+    assert_eq!(toks.len(), 1);
+    match &toks[0] {
+        muskitty_css::parser::ComponentValue::PreservedToken(Token::Url(u)) => {
+            assert_eq!(u, "bg.png")
+        }
+        other => panic!("expected Url token, got {other:?}"),
+    }
+}
+
+#[test]
+fn background_image_quoted_url_function() {
+    // 带引号形式 `url("bg.png")`：tokenizer 产出 Function("url")。
+    let element = make_element("div", &[]);
+    let sheet = make_sheet(
+        r#"div { background-image: url("bg.png"); }"#,
+        Origin::Author,
+    );
+    let toks = winner_tokens(&element, &sheet, "background-image");
+    match &toks[0] {
+        muskitty_css::parser::ComponentValue::Function(f) => {
+            assert_eq!(f.name.to_ascii_lowercase(), "url");
+            assert!(!f.value.is_empty(), "url function must carry its argument");
+        }
+        other => panic!("expected url Function, got {other:?}"),
+    }
+}
+
+#[test]
+fn background_image_none_and_missing_are_none() {
+    let element = make_element("div", &[]);
+    let sheet = make_sheet("div { background-image: none; }", Origin::Author);
+    assert_tok_ident(&winner_tokens(&element, &sheet, "background-image"), "none");
+    // 未声明 → compute 阶段以 initial（none）填充（与 registry 一致）。
+    let declared = collect_declared_values(
+        &element,
+        &[make_sheet("div { color: red; }", Origin::Author)],
+    );
+    let props: Vec<&str> = declared.iter().map(|d| d.property.as_str()).collect();
+    assert!(!props.contains(&"background-image"));
+}
+
+#[test]
+fn background_shorthand_expands_both_color_and_image() {
+    // background: url(x.png) no-repeat red center → 两个长属性同时产出。
+    let element = make_element("div", &[]);
+    let sheet = make_sheet(
+        "div { background: url(x.png) no-repeat red center; }",
+        Origin::Author,
+    );
+    assert_tok_ident(&winner_tokens(&element, &sheet, "background-color"), "red");
+    let toks = winner_tokens(&element, &sheet, "background-image");
+    assert!(
+        matches!(
+            &toks[0],
+            muskitty_css::parser::ComponentValue::PreservedToken(Token::Url(_))
+        ),
+        "image component must survive shorthand expansion, got {toks:?}"
+    );
+    // 无 image 分量 → background-image 取初始值 none。
+    let element2 = make_element("div", &[]);
+    let sheet2 = make_sheet("div { background: red; }", Origin::Author);
+    assert_tok_ident(
+        &winner_tokens(&element2, &sheet2, "background-image"),
+        "none",
+    );
+}
+
+#[test]
+fn background_global_keyword_resets_both_layers() {
+    let element = make_element("div", &[]);
+    let sheet = make_sheet("div { background: initial; }", Origin::Author);
+    assert_tok_ident(
+        &winner_tokens(&element, &sheet, "background-color"),
+        "initial",
+    );
+    assert_tok_ident(&winner_tokens(&element, &sheet, "background-image"), "none");
 }
 
 // —— font 简写 → font-size（+ line-height）——

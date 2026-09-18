@@ -139,6 +139,16 @@ pub static BUILTIN_PROPERTIES: &[PropertyDefinition] = &[
         inherited: false,
         percentages: PercentageBasis::None,
     },
+    // BG-1（M-3 batch 5 前置）：`background-image`，CSS Backgrounds L3 §3.1
+    // `none | <image>`。`<image>` 当前仅认 `url()`（`Token::Url` 或 `url()`
+    // 函数，css-syntax §4.3.8）；渐变函数按原始 token 序列透传，renderer 侧
+    // 判定不支持时跳过（记录为已知缺口）。
+    PropertyDefinition {
+        name: "background-image",
+        initial_value: "none",
+        inherited: false,
+        percentages: PercentageBasis::None,
+    },
     PropertyDefinition {
         name: "visibility",
         initial_value: "visible",

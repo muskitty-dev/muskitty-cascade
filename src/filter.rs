@@ -684,23 +684,65 @@ fn expand_flex(value: &[ComponentValue]) -> Vec<(&'static str, Vec<ComponentValu
     ]
 }
 
-/// `background` 简写（CSS Backgrounds L3 §8.10）：仅展开 `background-color`。
+/// `background` 简写（CSS Backgrounds L3 §8.10）：展开 `background-color` 与
+/// `background-image`（BG-1）。
 ///
-/// 其余子属性（image/position/size/repeat/origin/clip/attachment）当前无消费
-/// 方，推迟到有消费方时再展开。无颜色分量 → `background-color: transparent`
-/// （初始值）。单全局关键字 → `background-color` 取该关键字。
+/// 颜色分量按 [`is_background_color`] 反集法识别；图像分量认 `url()`
+/// （`Token::Url`（无引号形式）或 `url(...)` 函数（引号形式），css-syntax
+/// §4.3.8）以及透传的渐变函数（renderer 判定不支持时跳过）。其余子属性
+/// （position/size/repeat/origin/clip/attachment）仍无消费方，跳过。
+/// 无颜色分量 → `background-color: transparent`（初始值）；无 image 分量 →
+/// `background-image: none`（初始值）。单全局关键字 → 两个长属性取该关键字。
 fn expand_background(value: &[ComponentValue]) -> Vec<(&'static str, Vec<ComponentValue>)> {
     if let Some(kw) = single_global_keyword(value) {
-        return vec![("background-color", vec![ident_token(&kw)])];
+        return vec![
+            ("background-color", vec![ident_token(&kw)]),
+            ("background-image", vec![ident_token("none")]),
+        ];
     }
-    let color = non_ws_parts(value)
-        .into_iter()
-        .find(|cv| is_background_color(cv));
-    let color_cv = match color {
-        Some(c) => (*c).clone(),
-        None => ident_token("transparent"),
-    };
-    vec![("background-color", vec![color_cv])]
+    let parts = non_ws_parts(value);
+    let mut color: Option<ComponentValue> = None;
+    let mut image: Option<Vec<ComponentValue>> = None;
+    for cv in &parts {
+        if image.is_none() && is_background_image(cv) {
+            // §8.10：image 分量按原样保留（url token / url 函数 / 渐变函数）。
+            image = Some(vec![(*cv).clone()]);
+        } else if color.is_none() && is_background_color(cv) {
+            color = Some((*cv).clone());
+        }
+    }
+    vec![
+        (
+            "background-color",
+            vec![color.unwrap_or_else(|| ident_token("transparent"))],
+        ),
+        (
+            "background-image",
+            image.unwrap_or_else(|| vec![ident_token("none")]),
+        ),
+    ]
+}
+
+/// background 中可作 image 的分量（CSS Backgrounds L3 §3.1 支持子集）。
+///
+/// - `Token::Url(_)`：无引号 url 形式（tokenizer §4.3.8 直接产出）；
+/// - `url(...)` 函数：带引号形式（`url("x.png")`，函数名大小写不敏感）；
+/// - 渐变函数（linear/radial/conic-gradient）：按原样透传，绘制侧暂不支持
+///   并跳过（保留 token 以便后续实现，不静默改成 none）。
+fn is_background_image(cv: &ComponentValue) -> bool {
+    match cv {
+        ComponentValue::PreservedToken(Token::Url(_)) => true,
+        ComponentValue::Function(f) => {
+            f.name.eq_ignore_ascii_case("url")
+                || f.name.eq_ignore_ascii_case("linear-gradient")
+                || f.name.eq_ignore_ascii_case("radial-gradient")
+                || f.name.eq_ignore_ascii_case("conic-gradient")
+                || f.name.eq_ignore_ascii_case("repeating-linear-gradient")
+                || f.name.eq_ignore_ascii_case("repeating-radial-gradient")
+                || f.name.eq_ignore_ascii_case("repeating-conic-gradient")
+        }
+        _ => false,
+    }
 }
 
 /// `font` 简写（CSS Fonts L3 §3.8）：仅展开 `font-size`（+ 可选 `line-height`）。

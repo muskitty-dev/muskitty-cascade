@@ -67,5 +67,6 @@ pub use registry::{lookup_property, PropertyDefinition, BUILTIN_PROPERTIES};
 pub use style::{ComputedStyle, ComputedValue, DeclaredValue};
 pub use style_tree::{compute_styles, StyleTreeOptions};
 pub use text_props::{
-    apply_text_transform, text_transform_keyword, used_line_height_px, NORMAL_LINE_HEIGHT,
+    apply_text_transform, apply_white_space, text_transform_keyword, used_line_height_px,
+    white_space_keyword, WhiteSpace, NORMAL_LINE_HEIGHT,
 };

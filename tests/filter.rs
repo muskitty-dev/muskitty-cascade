@@ -462,6 +462,186 @@ fn media_comma_list_is_or() {
     assert_eq!(declared.len(), 1);
 }
 
+// ---- MQ-V：@media 求值矩阵（MQ L4 §3 三值逻辑 + §2.2 修饰符）----
+
+/// 在给定视口下收集 `@media <condition> { div { color: red } }` 的声明数。
+fn media_decl_count(condition: &str, viewport: (f32, f32)) -> usize {
+    let element = make_element("div", &[]);
+    let css = format!("@media {condition} {{ div {{ color: red; }} }}");
+    let sheet = make_sheet(&css, Origin::Author);
+    let media = MediaContext {
+        media_type: "screen",
+        viewport_w: viewport.0,
+        viewport_h: viewport.1,
+    };
+    let prepared = prepare_sheets_with_context(&[sheet], &media);
+    collect_declared_values_prepared(&element, &prepared).len()
+}
+
+/// 默认 screen 1920×1080 视口下的声明数。
+fn media_count_screen(condition: &str) -> usize {
+    media_decl_count(condition, (1920.0, 1080.0))
+}
+
+#[test]
+fn media_not_negates_the_whole_query() {
+    // §2.2：`not` 修饰整个 query —— `not print` 在 screen 上成立。
+    assert_eq!(media_count_screen("not print"), 1);
+    assert_eq!(media_count_screen("not screen"), 0);
+    // `not all` 恒不成立（§2.2 的 error-handling 替换值）。
+    assert_eq!(media_count_screen("not all"), 0);
+}
+
+#[test]
+fn media_only_modifier_is_transparent() {
+    // §2.2：`only` 对结果无影响（旧浏览器兼容修饰符）。
+    assert_eq!(media_count_screen("only screen"), 1);
+    assert_eq!(media_count_screen("only print"), 0);
+    assert_eq!(media_count_screen("only all"), 1);
+}
+
+#[test]
+fn media_unknown_feature_negated_stays_false() {
+    // §3 三值逻辑的核心用例：unknown 经 not 仍是 unknown（→ false）。
+    // 若把 unknown 当 false（二值近似），`not (orientation: bogus)` 会误判为
+    // true —— 这正是 Kleene 逻辑要防的事。
+    assert_eq!(media_count_screen("not (orientation: bogus)"), 0);
+    assert_eq!(media_count_screen("not (unknown-feature: 1px)"), 0);
+    assert_eq!(media_count_screen("not (min-resolution: 2dppx)"), 0);
+}
+
+#[test]
+fn media_unknown_absorbs_and_short_circuits_or() {
+    // §3：`false and unknown` = false；`true or unknown` = true；
+    // 其余组合里的 unknown 让整体变成 unknown（→ false）。
+    // 1920 视口下 (min-width: 100px) = true、(min-width: 9999px) = false。
+    assert_eq!(
+        media_count_screen("(min-width: 9999px) and (unknown-feature: x)"),
+        0,
+        "false AND unknown = false"
+    );
+    assert_eq!(
+        media_count_screen("(min-width: 100px) or (unknown-feature: x)"),
+        1,
+        "true OR unknown = true"
+    );
+    assert_eq!(
+        media_count_screen("(min-width: 100px) and (unknown-feature: x)"),
+        0,
+        "true AND unknown = unknown -> false"
+    );
+}
+
+#[test]
+fn media_malformed_query_is_not_all_but_recovers_at_comma() {
+    // §3 Error Handling：语法不匹配 → 该 query 变 `not all`（false），
+    // 但**不影响**下一个顶层逗号之后的 query。
+    assert_eq!(
+        media_count_screen("screen (min-width: 100px)"),
+        0,
+        "missing operator must be malformed"
+    );
+    assert_eq!(
+        media_count_screen("screen (min-width: 100px), screen"),
+        1,
+        "recovery at the next comma"
+    );
+    assert_eq!(
+        media_count_screen("screen and"),
+        0,
+        "dangling `and` is malformed"
+    );
+    assert_eq!(
+        media_count_screen("and screen"),
+        0,
+        "leading `and` is malformed"
+    );
+}
+
+#[test]
+fn media_em_and_rem_units_resolve_against_initial_font_size() {
+    // MQ L4 §4.1：媒体查询里的 em 以初始字号（16px）为基准。
+    // 1920 视口：60em = 960px → true；200em = 3200px → false。
+    assert_eq!(media_count_screen("(min-width: 60em)"), 1);
+    assert_eq!(media_count_screen("(min-width: 200em)"), 0);
+    assert_eq!(media_count_screen("(min-width: 60rem)"), 1);
+    // 边界：120em = 1920px，min/max 都用 <= / >=（闭区间）。
+    assert_eq!(media_count_screen("(min-width: 120em)"), 1);
+    assert_eq!(media_count_screen("(max-width: 120em)"), 1);
+}
+
+#[test]
+fn media_orientation_landscape_and_portrait() {
+    // §4：orientation = landscape 当且仅当宽 > 高。
+    assert_eq!(media_count_screen("(orientation: landscape)"), 1);
+    assert_eq!(media_count_screen("(orientation: portrait)"), 0);
+    assert_eq!(
+        media_decl_count("(orientation: portrait)", (768.0, 1024.0)),
+        1
+    );
+    assert_eq!(
+        media_decl_count("(orientation: landscape)", (768.0, 1024.0)),
+        0
+    );
+}
+
+#[test]
+fn media_height_features_and_units() {
+    // 1080 视口高度。
+    assert_eq!(media_count_screen("(min-height: 1000px)"), 1);
+    assert_eq!(media_count_screen("(max-height: 1000px)"), 0);
+    // 70em = 1120px ≥ 1080 → max-height 成立；60em = 960px < 1080 → 不成立。
+    assert_eq!(media_count_screen("(max-height: 70em)"), 1);
+    assert_eq!(media_count_screen("(min-height: 70em)"), 0);
+    assert_eq!(media_count_screen("(min-height: 60em)"), 1);
+}
+
+#[test]
+fn media_or_chain_of_features() {
+    // §3：无类型时是 <media-condition>，允许 `or` 链。
+    assert_eq!(
+        media_count_screen("(min-width: 9999px) or (min-width: 100px)"),
+        1,
+        "false OR true = true"
+    );
+    assert_eq!(
+        media_count_screen("(min-width: 9999px) or (min-width: 8888px)"),
+        0,
+        "false OR false = false"
+    );
+    // and 与 or 不得混用（不同产生式）→ malformed → not all。
+    assert_eq!(
+        media_count_screen("(min-width: 100px) and (max-width: 1px) or (min-width: 100px)"),
+        0,
+        "mixing and/or at one level is malformed"
+    );
+}
+
+#[test]
+fn media_nested_parenthesized_condition() {
+    // §3：括号内可嵌套条件（`media-in-parens` 的第二种分支）。
+    assert_eq!(
+        media_count_screen("((min-width: 100px) and (max-width: 9999px))"),
+        1
+    );
+    assert_eq!(media_count_screen("((min-width: 9999px))"), 0);
+    assert_eq!(media_count_screen("(not (min-width: 9999px))"), 1);
+}
+
+#[test]
+fn media_type_with_and_condition() {
+    // `screen and (min-width: 100px)`：类型与条件以 and 连接。
+    assert_eq!(media_count_screen("screen and (min-width: 100px)"), 1);
+    assert_eq!(media_count_screen("screen and (min-width: 9999px)"), 0);
+    assert_eq!(media_count_screen("print and (min-width: 100px)"), 0);
+}
+
+#[test]
+fn media_zero_length_without_unit() {
+    // 裸 0 是合法长度（`min-width: 0` 恒真）。
+    assert_eq!(media_count_screen("(min-width: 0)"), 1);
+}
+
 // ---- CS-1：sheet 级字段（disabled / alternate / media 属性）----
 
 /// 把 `media` 属性式的 media query 列表（ident 序列）挂到表上。
@@ -546,10 +726,95 @@ fn sheet_media_attribute_comma_list_is_or() {
 #[test]
 fn empty_sheet_media_applies() {
     // 空 media 列表 = 无媒体条件（内嵌 <style> 与无 media 属性的 link）。
+    // MQ L4 §2.1："An empty media query list evaluates to true"。
     let element = make_element("div", &[]);
     let sheet = make_sheet("div { color: red; }", Origin::Author);
     assert!(sheet.media.is_empty());
     assert_eq!(collect_declared_values(&element, &[sheet]).len(), 1);
+}
+
+/// 把 media query 文本编译为 sheet.media（component value 列表）。
+fn with_media_query(
+    mut sheet: muskitty_cssom::CssStyleSheet,
+    query: &str,
+) -> muskitty_cssom::CssStyleSheet {
+    use muskitty_css::parser::{parse_a_comma_separated_list_of_component_values, ComponentValue};
+    use muskitty_css::tokenizer::Token;
+    let groups = parse_a_comma_separated_list_of_component_values(query);
+    let mut out: Vec<ComponentValue> = Vec::new();
+    for (i, mut group) in groups.into_iter().enumerate() {
+        if i > 0 {
+            out.push(ComponentValue::PreservedToken(Token::Comma));
+        }
+        out.append(&mut group);
+    }
+    sheet.media = out;
+    sheet
+}
+
+/// 在给定视口下该表的生效声明数（走 sheet 级 media 门控）。
+fn sheet_media_count(query: &str, viewport: (f32, f32)) -> usize {
+    let element = make_element("div", &[]);
+    let sheet = with_media_query(make_sheet("div { color: red; }", Origin::Author), query);
+    let media = MediaContext {
+        media_type: "screen",
+        viewport_w: viewport.0,
+        viewport_h: viewport.1,
+    };
+    let prepared = prepare_sheets_with_context(&[sheet], &media);
+    collect_declared_values_prepared(&element, &prepared).len()
+}
+
+#[test]
+fn sheet_media_attribute_with_feature_query() {
+    // CS-1d 只验证了 ident 型 media；这里补齐**特性查询**（CS-1 规划里
+    // media 属性与 @media 共用同一求值器的正确性锚点）。
+    assert_eq!(
+        sheet_media_count("(min-width: 1000px)", (1920.0, 1080.0)),
+        1
+    );
+    assert_eq!(
+        sheet_media_count("(min-width: 3000px)", (1920.0, 1080.0)),
+        0
+    );
+    assert_eq!(sheet_media_count("(max-width: 800px)", (640.0, 480.0)), 1);
+    // 单位换算与 orientation 同样适用于 sheet 级 media。
+    assert_eq!(sheet_media_count("(min-width: 60em)", (1920.0, 1080.0)), 1);
+    assert_eq!(
+        sheet_media_count("(orientation: landscape)", (1920.0, 1080.0)),
+        1
+    );
+    assert_eq!(
+        sheet_media_count("(orientation: portrait)", (1920.0, 1080.0)),
+        0
+    );
+}
+
+#[test]
+fn sheet_media_attribute_negation_and_unknown() {
+    // `not screen` 在 screen 环境不生效；未知特性经 not 仍不生效（三值）。
+    assert_eq!(sheet_media_count("not screen", (1920.0, 1080.0)), 0);
+    assert_eq!(sheet_media_count("not print", (1920.0, 1080.0)), 1);
+    assert_eq!(
+        sheet_media_count("not (unknown-feature: 1px)", (1920.0, 1080.0)),
+        0,
+        "unknown negated stays unknown -> false"
+    );
+}
+
+#[test]
+fn sheet_media_attribute_malformed_is_pruned() {
+    // malformed media 属性 → 该表不生效（§3 error handling；不是"忽略属性"）。
+    assert_eq!(
+        sheet_media_count("screen (min-width: 1px)", (1920.0, 1080.0)),
+        0
+    );
+    assert_eq!(sheet_media_count("and screen", (1920.0, 1080.0)), 0);
+    // 同一列表内的合法 query 不受 malformed 邻居影响。
+    assert_eq!(
+        sheet_media_count("screen (min-width: 1px), screen", (1920.0, 1080.0)),
+        1
+    );
 }
 
 #[test]

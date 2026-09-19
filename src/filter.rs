@@ -291,12 +291,10 @@ fn prepare_rules(
 /// §5: 收集元素的所有 declared values。
 ///
 /// 遍历所有 stylesheet，对每条匹配 `element` 的 style rule，
-/// 收集其 declarations。递归处理嵌套 rules 和条件 group rules
-/// （@media/@supports/@container/@layer）。
-/// 最后收集元素 inline `style` 属性中的声明。
-///
-/// **简化**：条件 group rules 的条件评估推迟，当前无条件收集
-/// 所有嵌套 rules。
+/// 收集其 declarations。条件 group rules（@media/@supports/@container/@layer）
+/// 在 [`prepare_sheets`] 预处理阶段**已按当前媒体环境剪枝**（P2-6/MQ-V，
+/// 规则级条件不再是"推迟"——那是旧版实现的状态）。
+/// 最后收集元素 inline `style` 属性中的声明（§6.1 准则 4）。
 ///
 /// 便捷入口：每次调用内部 [`prepare_sheets`]（选择器重解析）。热路径
 /// （`compute_styles`）应改为 prepare 一次 + [`collect_declared_values_prepared`]。
@@ -348,8 +346,15 @@ pub fn collect_declared_values_prepared(
 
 /// 从元素 inline `style` 属性收集声明。
 ///
-/// inline style 声明的 specificity 为 (1,0,0,0)（最高优先级），
-/// origin 为 Author，from_style_attr = true。
+/// 属性的解析走 css-syntax §5.4.5 "parse a block's contents"（与样式表
+/// 声明块同一入口，故简写展开、`--*`、`!important` 行为完全一致）。
+///
+/// 排序语义（CSS Cascade L5 §6.1）：`from_style_attr = true`（准则 4，
+/// 位于 origin/importance 之后、cascade layer 之前）——inline 声明胜过
+/// 任何 cascade layer 的作者声明；**特异性为 `(0,0,0)`**（准则 3 的
+/// "element-attached styles" 靠标志位表达，不折算成特异性权重）；
+/// `layer_order = None`（inline 不在任何 @layer 内）；`order` 接在全部
+/// 规则之后递增（准则 7 的最后决定者）。origin 为 Author。
 fn collect_from_style_attr(
     element: &DomElement,
     order: &mut usize,
@@ -362,7 +367,8 @@ fn collect_from_style_attr(
 
     let block_contents = parse_a_blocks_contents(&style_str);
     // §6.1 准则 4: inline style 通过 from_style_attr 标志单独排序，
-    // specificity 本身为 (0,0,0)（准则 3 不会额外加权）
+    // specificity 本身为 (0,0,0)（准则 3 的 element-attached styles 不折算
+    // 特异性权重——`!important` 作者声明仍胜过 inline 普通值）。
     let specificity = Specificity::new(0, 0, 0);
 
     for rule in &block_contents.rules {
@@ -1175,91 +1181,371 @@ fn percentage_token(v: f64) -> ComponentValue {
 
 // ── P2-6: @media / @supports 条件评估 ─────────────────────────────
 
-/// 评估 `@media` 条件（P2-6）。
+/// 三值逻辑（Media Queries L4 §3 "Evaluating Media Queries"，Kleene logic）。
 ///
-/// 支持子集：媒体类型 `all` / `screen` / `print`；feature
-/// `(min/max-width/height: <px>)`；逻辑 `not` / `and`（`or` 少见，
-/// 主要用逗号分隔列表 = OR）。未知类型 / 未知 feature / 未知语法 →
-/// `false`（fail-closed）。
-fn eval_media_query(media: &MediaContext, condition: &[ComponentValue]) -> bool {
-    // 顶层逗号分隔的 media query 列表：任一命中即整体 true。
-    for query in split_on_commas(condition) {
-        if eval_media_query_list(media, query) {
-            return true;
+/// 规范原文：每个子表达式求值为 true / false / **unknown**；`unknown` 经 `not`
+/// 仍是 unknown（"The negation of unknown is unknown"）；`and` 只要有一项
+/// false 即 false（即使其余 unknown），`or` 只要有一项 true 即 true；
+/// 最终用于二值上下文时 unknown 收敛为 false。
+///
+/// 这条逻辑是 `general-enclosed`（前向兼容语法）能被安全忽略的前提：
+/// 若把 unknown 当 false，`not <未来语法>` 会错误地变成 true。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tristate {
+    /// 条件成立。
+    True,
+    /// 条件不成立。
+    False,
+    /// 语法当前无法判定（未知 feature / 未知类型 / general-enclosed）。
+    Unknown,
+}
+
+impl Tristate {
+    /// §3：`not` 取反；unknown 取反仍是 unknown。
+    fn negate(self) -> Self {
+        match self {
+            Tristate::True => Tristate::False,
+            Tristate::False => Tristate::True,
+            Tristate::Unknown => Tristate::Unknown,
         }
     }
-    false
+
+    /// §3：`and` —— 任一 false → false；否则任一 unknown → unknown；否则 true。
+    fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Tristate::False, _) | (_, Tristate::False) => Tristate::False,
+            (Tristate::Unknown, _) | (_, Tristate::Unknown) => Tristate::Unknown,
+            _ => Tristate::True,
+        }
+    }
+
+    /// §3：`or` —— 任一 true → true；否则任一 unknown → unknown；否则 false。
+    fn or(self, other: Self) -> Self {
+        match (self, other) {
+            (Tristate::True, _) | (_, Tristate::True) => Tristate::True,
+            (Tristate::Unknown, _) | (_, Tristate::Unknown) => Tristate::Unknown,
+            _ => Tristate::False,
+        }
+    }
+
+    /// §3 末段：进入二值上下文（`@media` 规则是否生效）时 unknown → false。
+    fn as_bool(self) -> bool {
+        matches!(self, Tristate::True)
+    }
+}
+
+/// 评估 `@media` 条件（P2-6 / MQ-V）。
+///
+/// 顶层逗号分隔的 media query 列表 = OR（MQ L4 §2.1）。**空列表求值为真**
+/// （§2.1 "An empty media query list evaluates to true"）——由调用方在
+/// `sheet_applies` 先行判定空列表，此处只处理非空列表。
+///
+/// 每个 query 按 §3 求值到三值，最终 unknown → false（§3 末段）。
+/// 单个 query 语法不匹配（malformed）按 §3 "Error Handling" 替换为
+/// `not all`（即 false），但**不影响同列表中其余 query**（错误在下一个
+/// 顶层逗号处恢复）。
+fn eval_media_query(media: &MediaContext, condition: &[ComponentValue]) -> bool {
+    let mut any = false;
+    for query in split_on_commas(condition) {
+        if eval_media_query_list(media, query).as_bool() {
+            any = true;
+        }
+    }
+    any
 }
 
 /// 求值单个 media query（无顶层逗号）。
-fn eval_media_query_list(media: &MediaContext, query: &[ComponentValue]) -> bool {
-    let mut result: Option<bool> = None;
-    let mut pending_op: Option<&'static str> = None;
-    let mut negate = false;
+///
+/// 语法（MQ L4 §3，简化到本实现支持的子集）：
+/// ```text
+/// <media-query> = <media-condition>
+///               | [ not | only ]? <media-type> [ and <media-condition-without-or> ]?
+/// ```
+/// - `not` / `only` 修饰符只作 query 前缀出现，且 `not` 取反**整个** query
+///   （§2.2），`only` 对结果无影响（仅为旧浏览器兼容）；
+/// - 语法不匹配 → `not all`（false）。本实现按"遇到无法归类的 token"判定
+///   不匹配（含缺运算符的相邻项，如 `screen (min-width: 1px)`）。
+fn eval_media_query_list(media: &MediaContext, query: &[ComponentValue]) -> Tristate {
+    let parts: Vec<&ComponentValue> = query
+        .iter()
+        .filter(|cv| !matches!(cv, ComponentValue::PreservedToken(Token::Whitespace)))
+        .collect();
 
-    for cv in query {
-        match cv {
-            ComponentValue::PreservedToken(Token::Whitespace) => {}
-            ComponentValue::PreservedToken(Token::Ident(name)) => {
-                if name.eq_ignore_ascii_case("not") {
-                    negate = true;
-                } else if name.eq_ignore_ascii_case("and") {
-                    pending_op = Some("and");
-                } else if name.eq_ignore_ascii_case("or") {
-                    pending_op = Some("or");
-                } else {
-                    let mut cond = eval_media_type(media.media_type, name);
-                    if negate {
-                        cond = !cond;
-                        negate = false;
-                    }
-                    combine_condition(&mut result, pending_op.take(), cond);
-                }
-            }
-            ComponentValue::SimpleBlock(b) => {
-                let mut cond = eval_media_feature(media, b);
-                if negate {
-                    cond = !cond;
-                    negate = false;
-                }
-                combine_condition(&mut result, pending_op.take(), cond);
-            }
-            _ => return false, // 未知语法 → fail-closed
+    let mut i = 0;
+    let mut negate = false;
+    // 前缀修饰符：`not` / `only`（二者至多出现一次，且必须在媒体类型之前）。
+    while let Some(ComponentValue::PreservedToken(Token::Ident(name))) = parts.get(i) {
+        if name.eq_ignore_ascii_case("not") && !negate {
+            negate = true;
+            i += 1;
+        } else if name.eq_ignore_ascii_case("only") {
+            i += 1;
+        } else {
+            break;
         }
     }
 
-    result.unwrap_or(false)
-}
-
-/// 求值媒体类型名（大小写不敏感）；未知类型 fail-closed。
-fn eval_media_type(current: &str, name: &str) -> bool {
-    match name.to_ascii_lowercase().as_str() {
-        "all" => true,
-        "screen" => current == "screen",
-        "print" => current == "print",
-        _ => false,
+    // `<media-type>`：`not <type>` 亦合法（`not print`）。类型之后的
+    // `and <condition-without-or>` 与媒体类型以 and 相连。
+    let result = match parts.get(i) {
+        // 无类型，纯条件：<media-condition> 产生式，**允许** `or`
+        // （`(min-width: 100px) or (max-width: 200px)`）。
+        Some(ComponentValue::SimpleBlock(_)) => eval_media_condition(media, &parts[i..]),
+        // 有类型：求值类型，然后（可选）`and` + 条件。
+        Some(ComponentValue::PreservedToken(Token::Ident(name))) => {
+            let ty = eval_media_type(media.media_type, name);
+            let mut j = i + 1;
+            if j == parts.len() {
+                ty
+            } else if matches!(parts.get(j), Some(ComponentValue::PreservedToken(Token::Ident(op)))
+                if op.eq_ignore_ascii_case("and"))
+            {
+                j += 1;
+                if j == parts.len() {
+                    // 悬空 `and` → 语法不匹配。
+                    Tristate::False
+                } else {
+                    ty.and(eval_condition_without_or(media, &parts[j..]))
+                }
+            } else {
+                // 缺运算符（如 `screen (min-width: 1px)`）→ malformed → not all。
+                Tristate::False
+            }
+        }
+        // 空 query 或无法归类的前缀 → malformed。
+        _ => Tristate::False,
+    };
+    if negate {
+        result.negate()
+    } else {
+        result
     }
 }
 
-/// 求值媒体 feature（`(min-width: Npx)` 等）；未知 feature fail-closed。
-fn eval_media_feature(media: &MediaContext, b: &SimpleBlock) -> bool {
+/// 求值 `<media-condition-without-or>`（`not`/`and` 连接的 terms）。
+///
+/// 语法：`<media-not> | <media-in-parens> [ and <media-in-parens> ]*`。
+/// `not` 只作用于紧随其后的单个 in-parens term（§3 的 `media-not` 产生式）。
+fn eval_condition_without_or(media: &MediaContext, parts: &[&ComponentValue]) -> Tristate {
+    let mut result: Option<Tristate> = None;
+    let mut pending_and = false;
+    let mut negate = false;
+    let mut i = 0;
+    while i < parts.len() {
+        match parts[i] {
+            ComponentValue::PreservedToken(Token::Ident(name))
+                if name.eq_ignore_ascii_case("not") =>
+            {
+                negate = true;
+            }
+            ComponentValue::PreservedToken(Token::Ident(name))
+                if name.eq_ignore_ascii_case("and") =>
+            {
+                pending_and = true;
+            }
+            // `or` 不允许出现在 without-or 位置（`and` / `or` 不可混用，
+            // §3 语法）→ malformed。
+            ComponentValue::PreservedToken(Token::Ident(name))
+                if name.eq_ignore_ascii_case("or") =>
+            {
+                return Tristate::False;
+            }
+            ComponentValue::PreservedToken(Token::Ident(name)) => {
+                // 条件位置的裸 ident（如 `screen`）→ 语法不匹配。
+                let _ = name;
+                return Tristate::False;
+            }
+            ComponentValue::SimpleBlock(b) => {
+                let mut cond = eval_media_in_parens(media, b);
+                if negate {
+                    cond = cond.negate();
+                    negate = false;
+                }
+                result = Some(match result {
+                    None => cond,
+                    Some(prev) if pending_and => prev.and(cond),
+                    // 缺运算符：两个相邻 term → malformed。
+                    Some(_) => return Tristate::False,
+                });
+                pending_and = false;
+            }
+            // 逗号 / 其他 token 不会出现在单 query 内（已按逗号切分）。
+            _ => return Tristate::False,
+        }
+        i += 1;
+    }
+    // 悬空 `and` / 空条件 → malformed。
+    if pending_and || negate || result.is_none() {
+        return Tristate::False;
+    }
+    result.unwrap_or(Tristate::False)
+}
+
+/// 求值一个 `media-in-parens`（`( ... )` 括号块，MQ L4 §3）。
+///
+/// 三类分支（按规范顺序）：
+/// 1. `(<media-feature>)` —— 媒体特性求值；
+/// 2. `(<media-condition>)` —— 嵌套条件（如 `((min-width: 1px) and ...)`）；
+/// 3. `general-enclosed`（无法归类的括号内容）→ **unknown**（不是 false——
+///    这正是三值逻辑存在的理由，见 [`Tristate`]）。
+fn eval_media_in_parens(media: &MediaContext, b: &SimpleBlock) -> Tristate {
     if b.kind != BlockKind::Paren {
-        return false;
+        return Tristate::Unknown;
     }
-    let name = match extract_decl_property(b) {
-        Some(n) => n,
-        None => return false,
-    };
-    let value = match extract_media_px(&b.value) {
-        Some(v) => v,
-        None => return false,
-    };
-    match name.as_str() {
-        "min-width" => media.viewport_w >= value,
-        "max-width" => media.viewport_w <= value,
-        "min-height" => media.viewport_h >= value,
-        "max-height" => media.viewport_h <= value,
+    // 分支 2：括号内是条件（含 `not`/`and`/`or` 关键字或嵌套括号）。
+    let inner: Vec<&ComponentValue> = b
+        .value
+        .iter()
+        .filter(|cv| !matches!(cv, ComponentValue::PreservedToken(Token::Whitespace)))
+        .collect();
+    if inner.is_empty() {
+        // `()` → general-enclosed → unknown。
+        return Tristate::Unknown;
+    }
+    // 首项是 ident（not/and/or 或未知关键字）或括号块 → 按 conditions 求值；
+    // 否则按 feature 求值（`(color)`) / `(min-width: 100px)`）。
+    let looks_like_condition = match inner[0] {
+        ComponentValue::PreservedToken(Token::Ident(name)) => {
+            name.eq_ignore_ascii_case("not")
+                || name.eq_ignore_ascii_case("and")
+                || name.eq_ignore_ascii_case("or")
+        }
+        ComponentValue::SimpleBlock(_) => true,
         _ => false,
+    };
+    if looks_like_condition {
+        // 括号内的条件可含 `or`（`media-condition` 产生式）。
+        return eval_media_condition(media, &inner);
+    }
+    eval_media_feature(media, b)
+}
+
+/// 求值 `<media-condition>`（允许 `or`），供括号内嵌套条件使用。
+fn eval_media_condition(media: &MediaContext, parts: &[&ComponentValue]) -> Tristate {
+    // 按 or 链 / and 链求值（规范禁止 and 与 or 在同一层级混用：
+    // `a and b or c` malformed）。
+    let mut saw_or = false;
+    let mut saw_and = false;
+    for cv in parts {
+        if let ComponentValue::PreservedToken(Token::Ident(name)) = cv {
+            if name.eq_ignore_ascii_case("or") {
+                saw_or = true;
+            } else if name.eq_ignore_ascii_case("and") {
+                saw_and = true;
+            }
+        }
+    }
+    if saw_or && saw_and {
+        // §3 语法不允许混合（`media-or` 与 `media-and` 是不同产生式）。
+        return Tristate::False;
+    }
+    if !saw_or {
+        return eval_condition_without_or(media, parts);
+    }
+
+    // or 链：逐段求值（每段是 `not`? term）。
+    let mut result: Option<Tristate> = None;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i <= parts.len() {
+        let at_end = i == parts.len();
+        let is_or = !at_end
+            && matches!(parts[i], ComponentValue::PreservedToken(Token::Ident(name))
+                if name.eq_ignore_ascii_case("or"));
+        if at_end || is_or {
+            if start == i {
+                // 空段（连续 or / 前导 or）→ malformed。
+                return Tristate::False;
+            }
+            let seg = eval_condition_without_or(media, &parts[start..i]);
+            result = Some(match result {
+                None => seg,
+                Some(prev) => prev.or(seg),
+            });
+            start = i + 1;
+        }
+        i += 1;
+    }
+    result.unwrap_or(Tristate::False)
+}
+
+/// 求值媒体类型名（大小写不敏感）。
+///
+/// `all` 恒真；`screen` / `print` 与当前类型比较；未知类型 → **unknown**
+/// （而非 false）：`not <未知类型>` 必须保持 unknown → 最终 false，
+/// 不能因"未知当 false"而变成 true。
+fn eval_media_type(current: &str, name: &str) -> Tristate {
+    match name.to_ascii_lowercase().as_str() {
+        "all" => Tristate::True,
+        "screen" | "print" => {
+            if current.eq_ignore_ascii_case(name) {
+                Tristate::True
+            } else {
+                Tristate::False
+            }
+        }
+        _ => Tristate::Unknown,
+    }
+}
+
+/// 求值媒体特性（MQ L4 §4/§5 支持子集）；未知特性 → unknown。
+///
+/// 支持范围（含单位换算）：
+/// - `width` / `height`（`min-` / `max-` 前缀），值为 px / em / rem；
+/// - `orientation`：`portrait`（高 ≥ 宽）/ `landscape`（宽 > 高）；
+/// - 范围语法（`width >= 600px`）与其余特性（`resolution`、`prefers-*` 等）
+///   → unknown（三值语义下 unknown 最终按 false 处理，但 `not unknown`
+///   仍为 false，符合 §3）。
+fn eval_media_feature(media: &MediaContext, b: &SimpleBlock) -> Tristate {
+    if b.kind != BlockKind::Paren {
+        return Tristate::Unknown;
+    }
+    let Some(name) = extract_decl_property(b) else {
+        return Tristate::Unknown;
+    };
+    let name = name.to_ascii_lowercase();
+
+    // orientation 是关键字型特性（无冒号）。
+    if name == "orientation" {
+        return match extract_media_keyword(&b.value).as_deref() {
+            Some(kw) if kw.eq_ignore_ascii_case("portrait") => {
+                bool_tristate(media.viewport_h >= media.viewport_w)
+            }
+            Some(kw) if kw.eq_ignore_ascii_case("landscape") => {
+                bool_tristate(media.viewport_w > media.viewport_h)
+            }
+            // 未知关键字 → general-enclosed（§3）。
+            _ => Tristate::Unknown,
+        };
+    }
+
+    // 长度型特性：min-/max- 前缀 + px/em/rem 值。
+    let (axis, is_min, is_max) = match name.as_str() {
+        "min-width" => (media.viewport_w, true, false),
+        "max-width" => (media.viewport_w, false, true),
+        "min-height" => (media.viewport_h, true, false),
+        "max-height" => (media.viewport_h, false, true),
+        _ => return Tristate::Unknown,
+    };
+    let Some(value) = extract_media_length(&b.value) else {
+        // 缺值 / 不支持的单位（`vh`、`calc()` 等）→ general-enclosed。
+        return Tristate::Unknown;
+    };
+    let cond = if is_min {
+        axis >= value
+    } else {
+        debug_assert!(is_max);
+        axis <= value
+    };
+    bool_tristate(cond)
+}
+
+/// `bool` → 三值（求值结果确定的二值条件）。
+fn bool_tristate(v: bool) -> Tristate {
+    if v {
+        Tristate::True
+    } else {
+        Tristate::False
     }
 }
 
@@ -1275,13 +1561,50 @@ fn extract_decl_property(b: &SimpleBlock) -> Option<String> {
     None
 }
 
-/// 从 component value 列表提取首个 px [`Token::Dimension`]。
-fn extract_media_px(values: &[ComponentValue]) -> Option<f32> {
+/// 提取括号块中首个 Ident 关键字（`orientation: landscape` 的 `landscape`）。
+fn extract_media_keyword(values: &[ComponentValue]) -> Option<String> {
+    // 跳过首个 ident（特性名）与冒号/空白，取后续首个 ident。
+    let mut seen_name = false;
     for cv in values {
-        if let ComponentValue::PreservedToken(Token::Dimension(n, unit)) = cv {
-            if unit.eq_ignore_ascii_case("px") {
-                return Some(n.value as f32);
+        match cv {
+            ComponentValue::PreservedToken(Token::Whitespace) => {}
+            ComponentValue::PreservedToken(Token::Colon) => {}
+            ComponentValue::PreservedToken(Token::Ident(s)) => {
+                if seen_name {
+                    return Some(s.clone());
+                }
+                seen_name = true;
             }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// 从 component value 列表提取首个长度值（px / em / rem → px）。
+///
+/// 换算基准（MQ L4 §4.1 "em" 与 CSS Values L4 §6 的 font-relative 长度）：
+/// 媒体查询里的 `em` 以**初始字号**（16px）为基准（不继承文档字号——
+/// 媒体查询在文档之外求值）；`rem` 同（根字号初值 16px）。
+/// `<number> 0` 亦合法（`min-width: 0`）→ 0px。
+fn extract_media_length(values: &[ComponentValue]) -> Option<f32> {
+    /// 媒体查询中 font-relative 单位的换算基准（CSS `medium` = 16px）。
+    const MEDIA_FONT_SIZE_PX: f32 = 16.0;
+    for cv in values {
+        match cv {
+            ComponentValue::PreservedToken(Token::Dimension(n, unit)) => {
+                let v = n.value as f32;
+                let unit = unit.to_ascii_lowercase();
+                return match unit.as_str() {
+                    "px" => Some(v),
+                    "em" | "rem" => Some(v * MEDIA_FONT_SIZE_PX),
+                    // em/rem 以外的单位（vh/vw/vmin/vmax/cm/pt/...）暂不支持。
+                    _ => None,
+                };
+            }
+            // 裸 `0`（无单位的零长度）。
+            ComponentValue::PreservedToken(Token::Number(n)) if n.value == 0.0 => return Some(0.0),
+            _ => {}
         }
     }
     None
@@ -1301,7 +1624,9 @@ fn split_on_commas(cvs: &[ComponentValue]) -> Vec<&[ComponentValue]> {
     segments
 }
 
-/// 累积逻辑条件：首项直接置入；后续按 `and` / `or` 连接。
+/// 累积逻辑条件（二值；`@supports` 求值用）：首项直接置入，后续按
+/// `and` / `or` 连接。媒体查询已改用 [`Tristate`] 三值逻辑（MQ L4 §3），
+/// 此helper 仅服务 `@supports`（CSS Conditional L3 无 unknown 概念）。
 fn combine_condition(result: &mut Option<bool>, op: Option<&'static str>, cond: bool) {
     match result {
         None => *result = Some(cond),

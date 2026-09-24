@@ -833,3 +833,220 @@ fn disabled_first_sheet_lets_later_one_win() {
         "胜者应来自未被禁用的第二张表"
     );
 }
+
+// ── B-1: 背景/圆角子属性注册与简写展开 ──────────────────────────
+
+fn declared_props(css: &str) -> Vec<String> {
+    let element = make_element("div", &[]);
+    let sheet = make_sheet(css, Origin::Author);
+    collect_declared_values(&element, &[sheet])
+        .into_iter()
+        .map(|d| d.property)
+        .collect()
+}
+
+fn value_of(css: &str, prop: &str) -> Option<String> {
+    let element = make_element("div", &[]);
+    let sheet = make_sheet(css, Origin::Author);
+    collect_declared_values(&element, &[sheet])
+        .into_iter()
+        .find(|d| d.property == prop)
+        .map(|d| {
+            use muskitty_css::tokenizer::Token;
+            use muskitty_cssom::ComponentValue;
+            d.value
+                .iter()
+                .filter_map(|cv| match cv {
+                    ComponentValue::PreservedToken(Token::Ident(s)) => Some(s.clone()),
+                    ComponentValue::PreservedToken(Token::Percentage(n)) => {
+                        Some(format!("{}%", n.value))
+                    }
+                    ComponentValue::PreservedToken(Token::Dimension(n, u)) => {
+                        Some(format!("{}{}", n.value, u))
+                    }
+                    ComponentValue::PreservedToken(Token::Number(n)) => Some(n.value.to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+}
+
+#[test]
+fn background_repeat_position_size_are_registered_longhands() {
+    // 未注册 → normalize_property_name 静默丢弃 → renderer 消费方全是死代码。
+    for p in [
+        "background-repeat",
+        "background-position",
+        "background-size",
+        "border-top-left-radius",
+        "border-top-right-radius",
+        "border-bottom-right-radius",
+        "border-bottom-left-radius",
+    ] {
+        let css = format!("div {{ {p}: initial; }}");
+        let props = declared_props(&css);
+        assert!(props.contains(&p.to_string()), "{p} 未注册，声明被丢弃");
+    }
+}
+
+#[test]
+fn border_radius_shorthand_expands_to_four_corners() {
+    // CSS Backgrounds L3 §5.1: 1–4 值顺时针，同 margin/padding 分配规则。
+    let props = declared_props("div { border-radius: 4px; }");
+    for c in [
+        "border-top-left-radius",
+        "border-top-right-radius",
+        "border-bottom-right-radius",
+        "border-bottom-left-radius",
+    ] {
+        assert!(props.contains(&c.to_string()), "{c} 缺失");
+    }
+    assert_eq!(
+        value_of("div { border-radius: 4px; }", "border-bottom-left-radius").as_deref(),
+        Some("4px")
+    );
+    // 2 值：top-left/bottom-right = 4px，top-right/bottom-left = 8px
+    let css = "div { border-radius: 4px 8px; }";
+    assert_eq!(
+        value_of(css, "border-top-left-radius").as_deref(),
+        Some("4px")
+    );
+    assert_eq!(
+        value_of(css, "border-top-right-radius").as_deref(),
+        Some("8px")
+    );
+    assert_eq!(
+        value_of(css, "border-bottom-right-radius").as_deref(),
+        Some("4px")
+    );
+    assert_eq!(
+        value_of(css, "border-bottom-left-radius").as_deref(),
+        Some("8px")
+    );
+    // 3 值：tl=4 tr=8 br=6 bl=8
+    let css = "div { border-radius: 4px 8px 6px; }";
+    assert_eq!(
+        value_of(css, "border-top-left-radius").as_deref(),
+        Some("4px")
+    );
+    assert_eq!(
+        value_of(css, "border-bottom-right-radius").as_deref(),
+        Some("6px")
+    );
+    assert_eq!(
+        value_of(css, "border-bottom-left-radius").as_deref(),
+        Some("8px")
+    );
+    // 4 值
+    let css = "div { border-radius: 1px 2px 3px 4px; }";
+    assert_eq!(
+        value_of(css, "border-top-right-radius").as_deref(),
+        Some("2px")
+    );
+    assert_eq!(
+        value_of(css, "border-bottom-left-radius").as_deref(),
+        Some("4px")
+    );
+}
+
+#[test]
+fn border_radius_slash_syntax_splits_horizontal_and_vertical() {
+    // Backgrounds L3 §5.1: `horizontal / vertical`，每个角两个值。
+    let css = "div { border-radius: 10px / 20px; }";
+    assert_eq!(
+        value_of(css, "border-top-left-radius").as_deref(),
+        Some("10px 20px"),
+        "斜杠后为垂直半径"
+    );
+    let css = "div { border-radius: 10px 30px / 20px 40px; }";
+    assert_eq!(
+        value_of(css, "border-top-left-radius").as_deref(),
+        Some("10px 20px")
+    );
+    assert_eq!(
+        value_of(css, "border-top-right-radius").as_deref(),
+        Some("30px 40px")
+    );
+    // 5 个水平值 → 无效，整条丢弃
+    assert!(
+        declared_props("div { border-radius: 1px 2px 3px 4px 5px; }").is_empty(),
+        "简写值无效时应丢弃整条声明（Cascade L5 §3.2 invalid at computed-value time 的过滤近似）"
+    );
+}
+
+#[test]
+fn border_radius_global_keyword_applies_to_all_corners() {
+    let props = declared_props("div { border-radius: inherit; }");
+    assert_eq!(props.len(), 4, "全局关键字应展开到四个角");
+    for p in &props {
+        assert!(p.ends_with("-radius"));
+    }
+    for c in [
+        "border-top-left-radius",
+        "border-top-right-radius",
+        "border-bottom-right-radius",
+        "border-bottom-left-radius",
+    ] {
+        assert_eq!(
+            value_of("div { border-radius: inherit; }", c).as_deref(),
+            Some("inherit")
+        );
+    }
+}
+
+#[test]
+fn background_shorthand_expands_repeat_position_and_size() {
+    // `/ <size>` 是 bg-layer 的最后一项，颜色写在最前（Backgrounds L3 §8.10）。
+    let css = "div { background: red url(x.png) no-repeat center / cover; }";
+    assert_eq!(
+        value_of(css, "background-repeat").as_deref(),
+        Some("no-repeat")
+    );
+    assert_eq!(
+        value_of(css, "background-position").as_deref(),
+        Some("center")
+    );
+    assert_eq!(value_of(css, "background-size").as_deref(), Some("cover"));
+    assert_eq!(value_of(css, "background-color").as_deref(), Some("red"));
+}
+
+#[test]
+fn background_shorthand_defaults_when_layers_omitted() {
+    // 省略时回退初始值（Backgrounds L3 §8.10：简写重置所有子属性）。
+    let css = "div { background: red; }";
+    assert_eq!(
+        value_of(css, "background-repeat").as_deref(),
+        Some("repeat")
+    );
+    assert_eq!(
+        value_of(css, "background-position").as_deref(),
+        Some("0% 0%")
+    );
+    assert_eq!(value_of(css, "background-size").as_deref(), Some("auto"));
+}
+
+#[test]
+fn background_shorthand_position_size_length_pair() {
+    let css = "div { background: url(x.png) no-repeat 10px 20px / 50% 60%; }";
+    assert_eq!(
+        value_of(css, "background-position").as_deref(),
+        Some("10px 20px")
+    );
+    assert_eq!(value_of(css, "background-size").as_deref(), Some("50% 60%"));
+    assert_eq!(
+        value_of(css, "background-repeat").as_deref(),
+        Some("no-repeat")
+    );
+}
+
+#[test]
+fn background_shorthand_auto_after_slash_is_not_a_color() {
+    // `/ auto` 的 `auto` 若被反集法误判为颜色，会把 size 吃掉。
+    let css = "div { background: url(x.png) / auto; }";
+    assert_eq!(value_of(css, "background-size").as_deref(), Some("auto"));
+    assert_eq!(
+        value_of(css, "background-color").as_deref(),
+        Some("transparent")
+    );
+}

@@ -149,6 +149,27 @@ pub static BUILTIN_PROPERTIES: &[PropertyDefinition] = &[
         inherited: false,
         percentages: PercentageBasis::None,
     },
+    // M-3 batch 5: 背景绘制子属性（CSS Backgrounds L3）。renderer 的
+    // `extract_background_repeat/position/size` 读取这三个 key——未注册会让
+    // 声明在 §5 Filtering 被静默丢弃，绘制侧消费方退化成永久死代码。
+    PropertyDefinition {
+        name: "background-repeat",
+        initial_value: "repeat",
+        inherited: false,
+        percentages: PercentageBasis::None,
+    },
+    PropertyDefinition {
+        name: "background-position",
+        initial_value: "0% 0%",
+        inherited: false,
+        percentages: PercentageBasis::None,
+    },
+    PropertyDefinition {
+        name: "background-size",
+        initial_value: "auto",
+        inherited: false,
+        percentages: PercentageBasis::None,
+    },
     PropertyDefinition {
         name: "visibility",
         initial_value: "visible",
@@ -443,6 +464,33 @@ pub static BUILTIN_PROPERTIES: &[PropertyDefinition] = &[
     PropertyDefinition {
         name: "border-left-color",
         initial_value: "currentcolor",
+        inherited: false,
+        percentages: PercentageBasis::None,
+    },
+    // M-3 batch 5: 圆角四角长属性（CSS Backgrounds L3 §5.1
+    // `<length-percentage>{1,2}`）。`border-radius` 是简写，在 filter.rs
+    // 展开为这四条，故自身不注册（与 margin/padding 一致）。
+    PropertyDefinition {
+        name: "border-top-left-radius",
+        initial_value: "0",
+        inherited: false,
+        percentages: PercentageBasis::None,
+    },
+    PropertyDefinition {
+        name: "border-top-right-radius",
+        initial_value: "0",
+        inherited: false,
+        percentages: PercentageBasis::None,
+    },
+    PropertyDefinition {
+        name: "border-bottom-right-radius",
+        initial_value: "0",
+        inherited: false,
+        percentages: PercentageBasis::None,
+    },
+    PropertyDefinition {
+        name: "border-bottom-left-radius",
+        initial_value: "0",
         inherited: false,
         percentages: PercentageBasis::None,
     },

@@ -520,10 +520,20 @@ fn expand_shorthand(
         Some(expand_border_box(value, BORDER_BOX_COLOR, is_border_color))
     } else if name.eq_ignore_ascii_case("outline") {
         Some(expand_outline(value))
+    } else if name.eq_ignore_ascii_case("border-radius") {
+        Some(expand_border_radius(value))
     } else {
         None
     }
 }
+
+/// 圆角四角长属性名（顺序 top-left / top-right / bottom-right / bottom-left）。
+const BORDER_RADIUS_CORNERS: [&str; 4] = [
+    "border-top-left-radius",
+    "border-top-right-radius",
+    "border-bottom-right-radius",
+    "border-bottom-left-radius",
+];
 
 /// margin 四向长属性名。
 const BOX_MARGIN: [&str; 4] = ["margin-top", "margin-right", "margin-bottom", "margin-left"];
@@ -699,24 +709,67 @@ fn expand_flex(value: &[ComponentValue]) -> Vec<(&'static str, Vec<ComponentValu
 /// （position/size/repeat/origin/clip/attachment）仍无消费方，跳过。
 /// 无颜色分量 → `background-color: transparent`（初始值）；无 image 分量 →
 /// `background-image: none`（初始值）。单全局关键字 → 两个长属性取该关键字。
+/// 支持子集（CSS Backgrounds L3 §8.10）：颜色、图像、`repeat`、`<position>`
+/// 与 `/ <size>`。`origin`/`clip`/`attachment` 仍无消费方，跳过。
+///
+/// 简写**重置**所有子属性（§8.10）：省略的分量回退各自初始值
+/// （`background-color: transparent`、`background-image: none`、
+/// `repeat`、`0% 0%`、`auto`），而不是保留此前的层叠值。
+///
+/// `<position>` 与 `<size>` 均按 ≤2 分量解析——与 renderer 的
+/// `extract_background_position/size` 消费能力对称；规范允许的 3/4 值
+/// `<position>`（`left 10px top 20px`）在此子集外，按初始值处理。
 fn expand_background(value: &[ComponentValue]) -> Vec<(&'static str, Vec<ComponentValue>)> {
     if let Some(kw) = single_global_keyword(value) {
-        return vec![
-            ("background-color", vec![ident_token(&kw)]),
-            ("background-image", vec![ident_token("none")]),
-        ];
+        return [
+            "background-color",
+            "background-image",
+            "background-repeat",
+            "background-position",
+            "background-size",
+        ]
+        .iter()
+        .map(|p| (*p, vec![ident_token(&kw)]))
+        .collect();
     }
-    let parts = non_ws_parts(value);
+    let all = non_ws_parts(value);
+    // `<position> / <size>` 的斜杠把序列切成两段；size 只可能出现在斜杠之后。
+    let slash = all
+        .iter()
+        .position(|cv| matches!(cv, ComponentValue::PreservedToken(Token::Delim('/'))));
+    let size = match slash {
+        Some(i) => {
+            let vals = background_size_components(&all[i + 1..]);
+            // 斜杠后无法解析出至少一个分量 → 简写语法无效，整条丢弃。
+            if vals.is_empty() {
+                return vec![];
+            }
+            vals
+        }
+        None => vec![ident_token("auto")],
+    };
+    let parts = match slash {
+        Some(i) => &all[..i],
+        None => &all[..],
+    };
+
     let mut color: Option<ComponentValue> = None;
     let mut image: Option<Vec<ComponentValue>> = None;
-    for cv in &parts {
-        if image.is_none() && is_background_image(cv) {
+    let mut repeat: Option<ComponentValue> = None;
+    let mut position: Vec<ComponentValue> = Vec::with_capacity(2);
+    for cv in parts {
+        if position.len() < 2 && is_background_position(cv) {
+            position.push((*cv).clone());
+        } else if repeat.is_none() && is_background_repeat(cv) {
+            repeat = Some((*cv).clone());
+        } else if image.is_none() && is_background_image(cv) {
             // §8.10：image 分量按原样保留（url token / url 函数 / 渐变函数）。
             image = Some(vec![(*cv).clone()]);
         } else if color.is_none() && is_background_color(cv) {
             color = Some((*cv).clone());
         }
     }
+    let initial_position = || vec![percentage_token(0.0), percentage_token(0.0)];
     vec![
         (
             "background-color",
@@ -726,7 +779,68 @@ fn expand_background(value: &[ComponentValue]) -> Vec<(&'static str, Vec<Compone
             "background-image",
             image.unwrap_or_else(|| vec![ident_token("none")]),
         ),
+        (
+            "background-repeat",
+            vec![repeat.unwrap_or_else(|| ident_token("repeat"))],
+        ),
+        (
+            "background-position",
+            if position.is_empty() {
+                initial_position()
+            } else {
+                position
+            },
+        ),
+        ("background-size", size),
     ]
+}
+
+/// `<bg-size>` 分量（Backgrounds L3 §3.9）：`cover` / `contain` / `auto` 或
+/// `<length-percentage>`，至多两个；非组分立即停止（剩余 token 属后续 bg-layer，
+/// 本项目不支持多层背景）。
+fn background_size_components(after: &[&ComponentValue]) -> Vec<ComponentValue> {
+    let mut out = Vec::with_capacity(2);
+    for cv in after.iter().take(2) {
+        let is_size = match cv {
+            ComponentValue::PreservedToken(Token::Dimension(..))
+            | ComponentValue::PreservedToken(Token::Percentage(..)) => true,
+            ComponentValue::PreservedToken(Token::Ident(s)) => ["cover", "contain", "auto"]
+                .iter()
+                .any(|k| s.eq_ignore_ascii_case(k)),
+            _ => false,
+        };
+        if !is_size {
+            break;
+        }
+        out.push((**cv).clone());
+    }
+    out
+}
+
+/// `<bg-position>` 分量（Backgrounds L3 §3.6 子集）：方向关键字或
+/// `<length-percentage>`。
+fn is_background_position(cv: &ComponentValue) -> bool {
+    match cv {
+        ComponentValue::PreservedToken(Token::Dimension(..))
+        | ComponentValue::PreservedToken(Token::Percentage(..)) => true,
+        ComponentValue::PreservedToken(Token::Ident(s)) => {
+            ["left", "right", "center", "top", "bottom"]
+                .iter()
+                .any(|k| s.eq_ignore_ascii_case(k))
+        }
+        _ => false,
+    }
+}
+
+/// `<repeat-style>` 分量（Backgrounds L3 §3.2）。
+fn is_background_repeat(cv: &ComponentValue) -> bool {
+    matches!(
+        cv,
+        ComponentValue::PreservedToken(Token::Ident(s))
+            if ["repeat", "repeat-x", "repeat-y", "no-repeat", "space", "round"]
+                .iter()
+                .any(|k| s.eq_ignore_ascii_case(k))
+    )
 }
 
 /// background 中可作 image 的分量（CSS Backgrounds L3 §3.1 支持子集）。
@@ -1021,6 +1135,76 @@ fn expand_outline(value: &[ComponentValue]) -> Vec<(&'static str, Vec<ComponentV
         &["outline-color"],
         "auto",
     )
+}
+
+/// `border-radius` 简写（CSS Backgrounds L3 §5.1）。
+///
+/// 语法 `<length-percentage>{1,4} [ / <length-percentage>{1,4} ]?`：斜杠前后
+/// 分别是水平/垂直半径组，各自按 [`expand_box_4`] 的 1–4 值规则分配到四角；
+/// 每角输出 `[水平, 垂直]` 两个分量（无斜杠时只输出水平分量，缺失的垂直半径
+/// 由 renderer 侧按等于水平半径处理——Backgrounds L3 §5.1 的圆角可能因相邻
+/// 角重叠而在绘制期收敛，计算期不假设）。
+///
+/// 任一侧分量数为 0 或 ≥5 → 无效，返回空（整条声明丢弃）。
+fn expand_border_radius(value: &[ComponentValue]) -> Vec<(&'static str, Vec<ComponentValue>)> {
+    if let Some(kw) = single_global_keyword(value) {
+        return BORDER_RADIUS_CORNERS
+            .iter()
+            .map(|p| (*p, vec![ident_token(&kw)]))
+            .collect();
+    }
+    let parts = non_ws_parts(value);
+    // 斜杠位置（`Token::Delim('/')`）：其后为垂直半径组。
+    let slash = parts
+        .iter()
+        .position(|cv| matches!(cv, ComponentValue::PreservedToken(Token::Delim('/'))));
+    let (horizontal, vertical) = match slash {
+        Some(i) => (&parts[..i], Some(&parts[i + 1..])),
+        None => (&parts[..], None),
+    };
+    if !is_radius_group_len(horizontal.len()) {
+        return vec![];
+    }
+    if let Some(v) = vertical {
+        if !is_radius_group_len(v.len()) {
+            return vec![];
+        }
+    }
+    let mut result = Vec::with_capacity(4);
+    for (i, prop) in BORDER_RADIUS_CORNERS.iter().enumerate() {
+        let mut v = vec![(*corner_component(horizontal, i)).clone()];
+        if let Some(vgroup) = vertical {
+            v.push((*corner_component(vgroup, i)).clone());
+        }
+        result.push((*prop, v));
+    }
+    result
+}
+
+/// 半径组的合法分量数（Backgrounds L3 §5.1：1–4）。
+fn is_radius_group_len(n: usize) -> bool {
+    (1..=4).contains(&n)
+}
+
+/// 按 1–4 值规则取第 `idx` 个角（0=tl, 1=tr, 2=br, 3=bl）的分量。
+///
+/// 分配同 CSS Box Model §3.1：`[a]` 全同；`[a b]` tl/br=a、tr/bl=b；
+/// `[a b c]` tl=a、tr/bl=b、br=c；`[a b c d]` 顺时针。
+fn corner_component<'a>(parts: &[&'a ComponentValue], idx: usize) -> &'a ComponentValue {
+    match parts.len() {
+        1 => parts[0],
+        2 => parts[idx % 2],
+        3 => {
+            if idx == 2 {
+                parts[2]
+            } else if idx == 0 {
+                parts[0]
+            } else {
+                parts[1]
+            }
+        }
+        _ => parts[idx],
+    }
 }
 
 /// 取非空白分量（借用）。

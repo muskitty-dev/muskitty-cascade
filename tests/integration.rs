@@ -794,13 +794,28 @@ fn background_shorthand_expands_both_color_and_image() {
 
 #[test]
 fn background_global_keyword_resets_both_layers() {
+    // CSS Cascade L5 §3.2：简写取全局关键字时，**每个**长属性都取该关键字。
+    // 旧实现把 background-image 硬编码成 `none`（锁定偏离规范的行为），现按
+    // §3.2 展开为 `initial`；defaulting 阶段按 registry 初始值解析，最终仍
+    // 落到 `none`。
     let element = make_element("div", &[]);
     let sheet = make_sheet("div { background: initial; }", Origin::Author);
     assert_tok_ident(
         &winner_tokens(&element, &sheet, "background-color"),
         "initial",
     );
-    assert_tok_ident(&winner_tokens(&element, &sheet, "background-image"), "none");
+    assert_tok_ident(
+        &winner_tokens(&element, &sheet, "background-image"),
+        "initial",
+    );
+    assert_tok_ident(
+        &winner_tokens(&element, &sheet, "background-repeat"),
+        "initial",
+    );
+    assert_tok_ident(
+        &winner_tokens(&element, &sheet, "background-size"),
+        "initial",
+    );
 }
 
 // —— font 简写 → font-size（+ line-height）——
